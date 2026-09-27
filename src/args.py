@@ -11,8 +11,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-import argcomplete
-
 from src.app_paths import DATA_DIR
 from src.audible import normalize_audible_url
 
@@ -1092,7 +1090,6 @@ class Args:
             type=str,
             dest="archive_password",
         )
-        argcomplete.autocomplete(parser)
         from src.console import logger
 
         parsed_args_ns, before_args = parser.parse_known_args(input)
