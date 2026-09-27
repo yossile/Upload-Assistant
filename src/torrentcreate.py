@@ -27,7 +27,7 @@ from src.console import console, is_cli_progress_suppressed, logger, progress_di
 from src.meta import Meta
 from src.stats import record_event, record_event_async
 from src.torrent_manifest import TorrentManifest
-from src.torrent_policy import PIECE_SIZE_MAX, PIECE_SIZE_MIN, hdbits_piece_size
+from src.torrent_policy import PASSTHEPOPCORN_MAX_PIECE_SIZE, PIECE_SIZE_MAX, PIECE_SIZE_MIN, hdbits_piece_size
 from src.torrent_policy import hdbits_pieces_allowed as hdbits_pieces_allowed
 from src.webui_progress import complete_progress, has_progress_callback, publish_progress
 
@@ -162,6 +162,8 @@ class TorrentCreator:
 
         if any(tracker in meta.trackers for tracker in ["HDBITS", "PASSTHEPOPCORN"]) and piece_size > 16 * 1024 * 1024:
             piece_size = 16 * 1024 * 1024
+        if "PASSTHEPOPCORN" in meta.trackers and piece_size > PASSTHEPOPCORN_MAX_PIECE_SIZE:
+            piece_size = PASSTHEPOPCORN_MAX_PIECE_SIZE
 
         # Enforce minimum and maximum limits
         piece_size = max(min_size, min(piece_size, max_size))

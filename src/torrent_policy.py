@@ -18,6 +18,7 @@ GIB = KIB**3
 TIB = KIB**4
 PIECE_SIZE_MIN = 32 * KIB
 PIECE_SIZE_MAX = 128 * MIB
+PASSTHEPOPCORN_MAX_PIECE_SIZE = 8 * MIB
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,7 @@ def _hdbits_validator(stats: TorrentStats) -> bool:
 
 
 HDBITS_POLICY = TorrentPolicy(validator=_hdbits_validator, piece_size_selector=hdbits_piece_size)
-PASSTHEPOPCORN_POLICY = TorrentPolicy(max_piece_size=16 * MIB)
+PASSTHEPOPCORN_POLICY = TorrentPolicy(max_piece_size=PASSTHEPOPCORN_MAX_PIECE_SIZE)
 ANTHELION_POLICY = TorrentPolicy(max_metainfo_size=250 * KIB, required_piece_size=128 * MIB)
 
 

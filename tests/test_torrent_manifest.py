@@ -124,7 +124,7 @@ def test_policy_selection_records_tracker_choice(tmp_path):
     large = tmp_path / "large.torrent"
     small = tmp_path / "small.torrent"
     write_torrent(large, 32 * MIB, 64 * MIB)
-    write_torrent(small, 16 * MIB, 64 * MIB)
+    write_torrent(small, 8 * MIB, 64 * MIB)
     manifest = TorrentManifest(tmp_path, "release")
     manifest.register(large, "base", "client:first")
     manifest.register(small, "base", "client:second")
@@ -132,7 +132,7 @@ def test_policy_selection_records_tracker_choice(tmp_path):
     selected = manifest.select("PASSTHEPOPCORN", "base", PASSTHEPOPCORN_POLICY)
 
     assert selected is not None
-    assert selected.piece_size == 16 * MIB
+    assert selected.piece_size == 8 * MIB
     assert manifest.selected_path("PASSTHEPOPCORN") == manifest.entry_path(selected)
 
 
@@ -149,11 +149,25 @@ async def test_concurrent_registration_keeps_manifest_valid(tmp_path):
 
 
 def test_tracker_policy_boundaries():
-    assert PASSTHEPOPCORN_POLICY.accepts(TorrentStats(16 * MIB, 1, 16 * MIB, 100))
-    assert not PASSTHEPOPCORN_POLICY.accepts(TorrentStats(32 * MIB, 1, 32 * MIB, 100))
+    assert PASSTHEPOPCORN_POLICY.accepts(TorrentStats(8 * MIB, 1, 8 * MIB, 100))
+    assert not PASSTHEPOPCORN_POLICY.accepts(TorrentStats(16 * MIB, 1, 16 * MIB, 100))
     assert ANTHELION_POLICY.accepts(TorrentStats(4 * MIB, 1, 4 * MIB, 250 * 1024))
     assert not ANTHELION_POLICY.accepts(TorrentStats(4 * MIB, 1, 4 * MIB, 250 * 1024 + 1))
     assert TorrentPolicy(max_piece_size=8 * MIB).choose_piece_size(100, 16 * MIB) == 8 * MIB
+
+
+def test_ptp_piece_size_calculation_respects_tracker_limit():
+    from src.meta import Meta
+
+    selected = TorrentCreator.calculate_piece_size(
+        20 * 1024 * MIB,
+        32 * 1024,
+        128 * MIB,
+        Meta(trackers=["PASSTHEPOPCORN"]),
+        piece_size=16,
+    )
+
+    assert selected == 8 * MIB
 
 
 def test_trackers_expose_typed_torrent_policies():
