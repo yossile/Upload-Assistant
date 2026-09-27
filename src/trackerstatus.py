@@ -75,9 +75,9 @@ class TrackerStatusManager:
             if tracker not in status_map:
                 status_map[tracker] = {}
 
-        # Prompt for IMDB ID once if any tracker needs it and it's missing in attended mode
+        # Prompt for IMDB ID once if a tracker needs it and it's missing in attended mode
         if not meta.get("unattended", False) and not meta.get("no_imdb", False) and meta.get("imdb_id", 0) == 0:
-            needs_imdb = "PASSTHEPOPCORN" in meta.trackers
+            needs_imdb = "PASSTHEPOPCORN" in meta.trackers and not meta.get("tmdb_id")
             if needs_imdb:
                 while True:
                     try:
@@ -140,7 +140,7 @@ class TrackerStatusManager:
 
             if tracker_name in tracker_class_map:
                 tracker_class = tracker_class_map[tracker_name](config=self.config)
-                if tracker_name == "PASSTHEPOPCORN" and local_meta.get("imdb_id", 0) == 0:
+                if tracker_name == "PASSTHEPOPCORN" and local_meta.get("imdb_id", 0) == 0 and not local_meta.get("tmdb_id"):
                     local_tracker_status["skipped"] = True
 
                 if not local_tracker_status["skipped"]:
@@ -243,7 +243,10 @@ class TrackerStatusManager:
                         if not local_tracker_status["skipped"]:
                             search_started = time.monotonic()
                             try:
-                                group_id = await ptp.get_group_by_imdb(local_meta["imdb"])
+                                if local_meta.get("imdb_id", 0):
+                                    group_id = await ptp.get_group_by_imdb(local_meta["imdb"])
+                                else:
+                                    group_id = await ptp.get_group_by_tmdb(local_meta["tmdb_id"])
                                 async with meta_lock:
                                     meta.ptp_groupid = group_id
                                 dupes = cast(list[Any], await ptp.search_existing(group_id or "", cast(dict[str, Any], local_meta)))

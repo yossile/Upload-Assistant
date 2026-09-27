@@ -325,6 +325,23 @@ class PassThePopcorn:
             "imdb": imdb,
             "json": "noredirect",
         }
+        return await self._get_group_by_identifier(params, f"IMDb: tt{imdb}")
+
+    async def get_group_by_tmdb(self, tmdb: int | str) -> str | None:
+        params = {
+            "tmdb": tmdb,
+            "json": "noredirect",
+        }
+        return await self._get_group_by_identifier(params, f"TMDB: {tmdb}", "TmdbId", tmdb, allow_selection=False)
+
+    async def _get_group_by_identifier(
+        self,
+        params: dict[str, int | str],
+        identifier_label: str,
+        response_identifier_key: str | None = None,
+        response_identifier: int | str | None = None,
+        allow_selection: bool = True,
+    ) -> str | None:
         headers = {"ApiUser": self.api_user, "ApiKey": self.api_key, "User-Agent": self.user_agent}
         url = f"{self.base_url}/torrents.php"
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -347,22 +364,28 @@ class PassThePopcorn:
                 return None
 
             if response_data.get("TotalResults"):  # Search results page
-                total_results = int(response_data.get("TotalResults", 0))
+                movies = cast(list[dict[str, Any]], response_data.get("Movies", []))
+                if response_identifier_key is not None and response_identifier is not None:
+                    expected_identifier = str(response_identifier)
+                    movies = [movie for movie in movies if str(movie.get(response_identifier_key, "")) == expected_identifier]
+                total_results = len(movies)
                 if total_results == 0:
-                    logger.info(f"{self.tracker}: [yellow]No results found for IMDb: tt{imdb}[/yellow]")
+                    logger.info(f"{self.tracker}: [yellow]No results found for {identifier_label}[/yellow]")
                     return None
                 if total_results == 1:
                     # Single result - use it
-                    movie = response_data.get("Movies", [{}])[0]
+                    movie = movies[0]
                     group_id: str | None = str(movie.get("GroupId")) if movie.get("GroupId") is not None else None
                     title = movie.get("Title", "Unknown")
                     year = movie.get("Year", "Unknown")
-                    logger.info(f"{self.tracker}: [green]Found single match for IMDb: [yellow]tt{imdb}[/yellow] -> Group ID: [yellow]{group_id}[/yellow][/green]")
+                    logger.info(f"{self.tracker}: [green]Found single match for {identifier_label} -> Group ID: [yellow]{group_id}[/yellow][/green]")
                     logger.info(f"{self.tracker}: [green]Title: [yellow]{title}[/yellow] ([yellow]{year}[/yellow])")
                     return group_id
+                if not allow_selection:
+                    logger.info(f"{self.tracker}: [yellow]Multiple groups matched {identifier_label}; creating a new group instead of prompting.[/yellow]")
+                    return None
                 # Multiple results - let user choose
-                logger.info(f"{self.tracker}: [yellow]Found {total_results} matches for IMDb: tt{imdb}[/yellow]")
-                movies = cast(list[dict[str, Any]], response_data.get("Movies", []))
+                logger.info(f"{self.tracker}: [yellow]Found {total_results} matches for {identifier_label}[/yellow]")
                 choices: list[str] = []
                 for _i, movie in enumerate(movies):
                     title = movie.get("Title", "Unknown")
@@ -399,7 +422,7 @@ class PassThePopcorn:
                 return None
             elif response_data.get("Page") == "Details":  # Group Found
                 group_id = response_data.get("GroupId")
-                logger.info(f"{self.tracker}: [green]Matched IMDb: [yellow]tt{imdb}[/yellow] to Group ID: [yellow]{group_id}[/yellow][/green]")
+                logger.info(f"{self.tracker}: [green]Matched {identifier_label} to Group ID: [yellow]{group_id}[/yellow][/green]")
                 logger.info(f"{self.tracker}: [green]Title: [yellow]{response_data.get('Name')}[/yellow] ([yellow]{response_data.get('Year')}[/yellow])")
                 return str(group_id) if group_id is not None else None
         except Exception:
@@ -602,7 +625,7 @@ class PassThePopcorn:
 
     def get_type(self, imdb_info: dict[str, Any], meta: Meta) -> str | None:
         ptp_type = None
-        if imdb_info["type"] is not None:
+        if imdb_info.get("type") is not None:
             imdb_type = imdb_info.get("type", "movie").lower()
             if imdb_type in ("movie", "tv movie", "tvmovie"):
                 ptp_type = "Feature Film" if int(imdb_info.get("runtime", "60")) >= 45 or int(imdb_info.get("runtime", "60")) == 0 else "Short Film"
