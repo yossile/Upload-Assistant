@@ -1623,12 +1623,18 @@ class PassThePopcorn:
                     logger.info(f"{self.tracker}: [red]Cover URL must end with .jpg, .jpeg, .png, or .webp")
                     continue
                 cover = await self.rehost_poster_to_selected_host(meta, cover_input)
+            tmdb_id = meta.tmdb_id or meta.tmdb
+            tmdb_type = (meta.tmdb_type or "movie").lower()
+            tmdb_path = "tv" if tmdb_type in ("tv", "series", "tv_show") else "movie"
+            album_desc = tinfo.get("plot", tinfo.get("album_desc", meta.overview)) or ""
+            if tmdb_id:
+                album_desc = f"{album_desc}\n\nhttps://www.themoviedb.org/{tmdb_path}/{tmdb_id}"
             new_data = {
                 "title": tinfo.get("title", meta.imdb_info.get("title", meta.title)),
                 "year": tinfo.get("year", meta.imdb_info.get("year", meta.year)),
                 "image": cover,
                 "tags": tinfo.get("tags", ""),
-                "album_desc": tinfo.get("plot", meta.overview),
+                "album_desc": album_desc,
                 "trailer": meta.youtube,
             }
             if new_data["year"] in ["", "0", 0, None] and meta.manual_year not in [0, "", None]:
