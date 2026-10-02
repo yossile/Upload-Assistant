@@ -337,6 +337,7 @@ class Meta:
     no_edition: bool = False
     no_ids: bool = False
     no_imdb: bool = False
+    no_tmdb: bool = False
     automatic_imdb_rejected: bool = False
     no_override: bool = False
     no_season: bool = False

@@ -551,7 +551,9 @@ class Args:
             choices=["2160p", "1080p", "1080i", "720p", "576p", "576i", "480p", "480i", "8640p", "4320p", "other"],
         )
         action_res.completer = resolution_completer
-        parser.add_argument("-tmdb", "--tmdb", nargs=1, required=False, help="TMDb ID (use movie/ or tv/ prefix)", type=str, dest="tmdb_manual")
+        tmdb_group = parser.add_mutually_exclusive_group()
+        tmdb_group.add_argument("-tmdb", "--tmdb", nargs=1, required=False, help="TMDb ID (use movie/ or tv/ prefix)", type=str, dest="tmdb_manual")
+        tmdb_group.add_argument("--no-tmdb", action="store_true", required=False, help="Do not search for or use TMDb metadata")
         imdb_group = parser.add_mutually_exclusive_group()
         imdb_group.add_argument("-imdb", "--imdb", nargs=1, required=False, help="IMDb ID", type=str, dest="imdb_manual")
         imdb_group.add_argument("--no-imdb", action="store_true", required=False, help="Do not search for or use IMDb metadata")
