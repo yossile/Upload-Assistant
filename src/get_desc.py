@@ -2255,6 +2255,10 @@ class DescriptionBuilder:
                     char_count += len("[center][spoiler=Other files]\n")
                     other_files_spoiler_open = True
 
+                if i == 0 and screenheader is not None:
+                    desc_parts.append(screenheader + "\n")
+                    char_count += len(screenheader + "\n")
+
                 # Write filename in BBCode format with MediaInfo in spoiler if not the first file
                 if multi_screens != 0:
                     if i > 0 and char_count < max_char_limit:
@@ -2271,9 +2275,6 @@ class DescriptionBuilder:
                 new_images_key = f"new_images_file_{i}"
                 if i == 0:  # For the first file, use 'image_list' key and add screenheader if applicable
                     if images:
-                        if screenheader is not None:
-                            desc_parts.append(screenheader + "\n")
-                            char_count += len(screenheader + "\n")
                         desc_parts.append("[center]")
                         char_count += len("[center]")
                         for img_index in range(len(images)):

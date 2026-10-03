@@ -68,6 +68,7 @@ def test_first_file_has_filename_and_one_screenshot_header(pack):
     assert result.count("Show.S01E01") == 1
     assert result.count(HEADER) == 1
     assert result.count(_image("first")["raw_url"]) == 1
+    assert result.index(HEADER) < result.index("Show.S01E01") < result.index(_image("first")["raw_url"])
     assert "Show.S01E02" not in result
 
 
