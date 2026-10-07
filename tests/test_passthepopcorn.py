@@ -1,9 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 
 from src.meta import Meta
 from src.tracker_images import set_tracker_image_collection
+from src.artwork import select_ptp_cover_url
 from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
 
@@ -71,6 +73,31 @@ def test_get_type_supports_tmdb_only_metadata() -> None:
     assert tracker.get_type({}, meta) == "Feature Film"  # noqa: S101
 
 
+def test_select_ptp_cover_url_falls_back_to_tmdb_poster() -> None:
+    meta = Meta(tmdb_poster_path="/poster.jpg")
+
+    assert select_ptp_cover_url(meta) == "https://image.tmdb.org/t/p/original/poster.jpg"  # noqa: S101
+
+
+def test_select_ptp_cover_url_prefers_imdb_cover(monkeypatch) -> None:
+    meta = Meta(imdb_info={"cover": "https://imdb.example/poster.jpg"}, tmdb_poster_path="/poster.jpg")
+
+    assert select_ptp_cover_url(meta) == "https://imdb.example/poster.jpg"  # noqa: S101
+
+
+def test_select_ptp_cover_url_prefers_explicit_poster(monkeypatch) -> None:
+    monkeypatch.setattr("src.artwork.is_public_http_url", lambda _url: True)
+    meta = Meta(explicit_poster="https://custom.example/poster.jpg", imdb_info={"cover": "https://imdb.example/poster.jpg"})
+
+    assert select_ptp_cover_url(meta) == "https://custom.example/poster.jpg"  # noqa: S101
+
+
+def test_select_ptp_cover_url_uses_artwork_before_tmdb_poster() -> None:
+    meta = Meta(artwork_url="https://custom.example/poster.jpg", tmdb_poster_path="/poster.jpg")
+
+    assert select_ptp_cover_url(meta) == "https://custom.example/poster.jpg"  # noqa: S101
+
+
 def test_convert_bbcode_removes_unsupported_font_tags() -> None:
     tracker = object.__new__(PassThePopcorn)
 
@@ -85,6 +112,22 @@ def test_convert_bbcode_clamps_unsupported_size_tags() -> None:
     converted = tracker.convert_bbcode("[size=4]Normal[/size] [size=16]Oversized[/size]")
 
     assert converted == "[size=4]Normal[/size] [size=10]Oversized[/size]"  # noqa: S101
+
+
+def test_find_non_ascii_torrent_paths_includes_root_and_files() -> None:
+    torrent = SimpleNamespace(name="El Bumbún", files=["El Bumbún/video.mkv", "subs/español.srt"])
+
+    assert PassThePopcorn._find_non_ascii_torrent_paths(torrent) == [  # noqa: S101
+        "El Bumbún",
+        "El Bumbún/video.mkv",
+        "subs/español.srt",
+    ]
+
+
+def test_find_non_ascii_torrent_paths_allows_ascii_paths() -> None:
+    torrent = SimpleNamespace(name="El.Bumbun", files=["El.Bumbun/video.mkv"])
+
+    assert PassThePopcorn._find_non_ascii_torrent_paths(torrent) == []  # noqa: S101
 
 
 def test_disc_menu_images_precede_movie_screenshots_in_description() -> None:

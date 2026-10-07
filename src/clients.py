@@ -668,12 +668,13 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
             # Reuse if disc and basename matches or --keep-folder was specified
             if (meta.is_disc and meta.is_disc != "") or (meta.keep_folder and meta.isdir):
                 torrent_name = torrent.metainfo["info"]["name"]
-                if meta_uuid != torrent_name and meta.debug:
-                    logger.info("Modified file structure, skipping hash")
-                    valid = False
-                torrent_filepath = os.path.commonpath(torrent.files)
-                if Path(meta_path).name in torrent_filepath:
+                if meta.is_disc and meta.is_disc != "":
+                    torrent_filepath = os.path.commonpath(torrent.files)
+                    valid = Path(meta_path).name in torrent_filepath
+                elif torrent_name == meta_uuid:
                     valid = True
+                elif meta.debug:
+                    logger.info("Modified file structure, skipping hash")
                 logger.debug(f"Torrent is valid based on disc/basename or keep-folder: {valid}")
 
             # Otherwise we match either only videos (no subtitles) OR videos + subtitles (if subtitles are present)

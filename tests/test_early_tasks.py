@@ -1,6 +1,7 @@
 # ruff: noqa: S101
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from src import early_tasks
@@ -163,6 +164,47 @@ def test_early_torrent_task_refreshes_layouts_after_reuse(monkeypatch, tmp_path)
             trackers=["TEST"],
         )
         client = SimpleNamespace(find_existing_torrent=find_reuse)
+
+        await early_tasks.create_base_torrents_early(meta, client)
+
+        assert outputs == ["BASE"]
+
+    asyncio.run(exercise())
+
+
+def test_early_torrent_task_regenerates_mismatched_keep_folder_base(monkeypatch, tmp_path) -> None:
+    async def exercise() -> None:
+        layouts = {"base": tmp_path / "stale.torrent", "base_subs": None}
+        outputs = []
+
+        def default_path(_self, layout="base"):
+            return layouts[layout]
+
+        def clear_default(_self, layout="base"):
+            layouts[layout] = None
+
+        async def create_torrent(_meta, _path, output, **_kwargs):
+            outputs.append(output)
+            layouts["base"] = tmp_path / "fresh.torrent"
+
+        monkeypatch.setattr(early_tasks.TorrentManifest, "default_path", default_path)
+        monkeypatch.setattr(early_tasks.TorrentManifest, "clear_default", clear_default)
+        monkeypatch.setattr(early_tasks.Torrent, "read", lambda _path: SimpleNamespace(metainfo={"info": {"name": "release.mkv"}}))
+        monkeypatch.setattr(early_tasks.TorrentCreator, "create_torrent", create_torrent)
+        meta = Meta(
+            base_dir=str(tmp_path),
+            category="MOVIE",
+            isdir=True,
+            keep_folder=True,
+            uuid="release",
+            path=str(tmp_path / "release"),
+            trackers=["TEST"],
+        )
+        Path(meta.path).mkdir()
+        async def find_existing_torrent(_meta):
+            return None
+
+        client = SimpleNamespace(find_existing_torrent=find_existing_torrent)
 
         await early_tasks.create_base_torrents_early(meta, client)
 

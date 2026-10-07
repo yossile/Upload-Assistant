@@ -3,6 +3,7 @@
 import ast
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,6 +13,31 @@ from src.clients import Clients
 from src.config_sync import sync_user_config
 from src.configvalidator import DEFAULT_KEY_TYPES, validate_config
 from src.meta import Meta
+
+
+def test_keep_folder_does_not_reuse_single_file_torrent_with_matching_prefix(tmp_path: Path) -> None:
+    release_dir = tmp_path / "susan.2025.1080p.web.h264-grashopr"
+    release_dir.mkdir()
+    torrent_path = tmp_path / "existing.torrent"
+    torrent_path.touch()
+    meta = Meta(
+        category="MOVIE",
+        keep_folder=True,
+        path=str(release_dir),
+        uuid=release_dir.name,
+        filelist=[str(release_dir / f"{release_dir.name}.mkv")],
+        debug=True,
+    )
+    torrent = SimpleNamespace(
+        files=[f"{release_dir.name}.mkv"],
+        metainfo={"info": {"name": f"{release_dir.name}.mkv"}},
+    )
+    clients = Clients({"DEFAULT": {}})
+
+    with patch("src.clients.Torrent.read", return_value=torrent):
+        valid, _ = asyncio.run(clients.is_valid_torrent(meta, str(torrent_path), "hash", "qbit", {}))
+
+    assert not valid
 
 
 def test_find_existing_torrents_skips_unconfigured_client_after_config_sync(tmp_path: Path) -> None:

@@ -39,6 +39,55 @@ async def test_prompt_yes_no_serializes_concurrent_prompts(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_ptp_scene_without_kept_folder_requires_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts: list[tuple[str, bool]] = []
+    helper = UploadHelper({"DEFAULT": {}})
+
+    async def reject(question: str, *, default: bool = False) -> bool:
+        prompts.append((question, default))
+        return False
+
+    monkeypatch.setattr(helper, "prompt_yes_no", reject)
+    meta = Meta(category="MOVIE", scene=True, trackers=["PTP"], isdir=False)
+
+    assert await helper.confirm_ptp_scene_layout(meta) is False
+    assert len(prompts) == 1
+    assert prompts[0][1] is False
+    assert "scene RAR" in prompts[0][0]
+
+
+@pytest.mark.asyncio
+async def test_ptp_scene_with_kept_folder_does_not_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    helper = UploadHelper({"DEFAULT": {}})
+
+    async def unexpected_prompt(*_args, **_kwargs) -> bool:
+        pytest.fail("A kept release folder should not trigger a confirmation prompt")
+
+    monkeypatch.setattr(helper, "prompt_yes_no", unexpected_prompt)
+    release_dir = tmp_path / "scene-release"
+    release_dir.mkdir()
+    meta = Meta(category="MOVIE", scene=True, trackers=["PASSTHEPOPCORN"], path=str(release_dir), isdir=True, keep_folder=True)
+
+    assert await helper.confirm_ptp_scene_layout(meta) is True
+
+
+@pytest.mark.asyncio
+async def test_unattended_ptp_scene_without_kept_folder_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    warnings: list[str] = []
+    helper = UploadHelper({"DEFAULT": {}})
+    monkeypatch.setattr("src.uphelper.logger.warning", lambda message: warnings.append(message))
+
+    async def unexpected_prompt(*_args, **_kwargs) -> bool:
+        pytest.fail("Unattended mode should skip rather than prompt")
+
+    monkeypatch.setattr(helper, "prompt_yes_no", unexpected_prompt)
+    meta = Meta(category="MOVIE", scene=True, trackers=["PTP"], unattended=True)
+
+    assert await helper.confirm_ptp_scene_layout(meta) is False
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
 async def test_dupe_check_keeps_each_result_list_with_its_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     first_started = threading.Event()
     release_first = threading.Event()
@@ -192,6 +241,29 @@ async def test_book_confirmation_explains_how_to_add_missing_audible_marketplace
     assert "Audible URL" in messages[0]
     assert "--audible-url" in messages[0]
     assert "DEFAULT.audible_domain" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_video_confirmation_shows_explicit_ptp_cover(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr("src.uphelper.logger.info", lambda message, **_kwargs: messages.append(message))
+    monkeypatch.setattr("src.artwork.is_public_http_url", lambda _url: True)
+    meta = Meta(
+        category="MOVIE",
+        tmdb_id=1400432,
+        tmdb_poster_path="/rp0n3G5v6vdkGvEz6djEeRwZ4fH.jpg",
+        explicit_poster="https://custom.example/poster.jpg",
+        imdb_info={"cover": "https://m.media-amazon.com/images/example.jpg"},
+        trackers=["PASSTHEPOPCORN"],
+        unattended=True,
+    )
+
+    assert await UploadHelper({"DEFAULT": {}}).get_confirmation(meta) is True
+
+    assert "PTP Cover" in messages[0]
+    assert "https://custom.example/poster.jpg" in messages[0]
+    assert "https://m.media-amazon.com/images/example.jpg" not in messages[0]
+    assert "https://image.tmdb.org/t/p/original/rp0n3G5v6vdkGvEz6djEeRwZ4fH.jpg" not in messages[0]
 
 
 @pytest.mark.parametrize(

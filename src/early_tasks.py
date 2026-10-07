@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from torf import Torrent
+
 from src.clients import Clients
 from src.console import CliProgressGate, logger, suppress_cli_progress
 from src.meta import Meta
@@ -89,6 +91,15 @@ async def create_base_torrents_early(meta: Meta, client: Clients) -> None:
     manifest = TorrentManifest(meta.base_dir, meta.uuid)
     torrent_path = manifest.default_path("base")
     subs_torrent_path = manifest.default_path("base_subs")
+    if torrent_path is not None and meta.keep_folder and meta.isdir:
+        try:
+            registered_name = Torrent.read(torrent_path).metainfo["info"]["name"]
+        except Exception:
+            registered_name = None
+        if registered_name != meta.uuid:
+            logger.debug("[yellow]Registered base torrent layout does not match --keep-folder; regenerating.[/yellow]")
+            manifest.clear_default("base")
+            torrent_path = None
     needs_subs = bool(meta.subtitle_files) and subs_torrent_path is None
     if torrent_path is not None and not needs_subs:
         logger.debug(f"[cyan]Skipping early torrent creation; a base is already registered at {torrent_path}[/cyan]")

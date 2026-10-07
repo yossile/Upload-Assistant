@@ -253,8 +253,7 @@ class TorrentCreator:
                         exclude = ["*.*", "*sample.mkv"]
                         meta.mkbrr = False
                     elif not meta.tv_pack:
-                        folder_name = Path(str(path)).name
-                        include = [f"{folder_name}/{Path(f).name}" for f in creation_filelist]
+                        include = [Path(f).name for f in creation_filelist]
                         exclude = ["*", "*/**"]
 
                 elif meta.isdir:
@@ -355,6 +354,9 @@ class TorrentCreator:
                         if not meta.is_disc and meta.category in ("MOVIE", "TV"):
                             exclude_str = cls.build_mkbrr_exclude_string(str(path), creation_filelist, allow_subs=is_subs)
                             cmd.extend(["--exclude", exclude_str])
+
+                        if include:
+                            cmd.extend(["--include", ",".join(include)])
 
                         cmd.extend(["-o", str(output_path)])
                         logger.debug(f"[cyan]mkbrr cmd: {cmd}")

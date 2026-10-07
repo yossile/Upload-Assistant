@@ -32,7 +32,12 @@ def _safe_input(prompt: str = "") -> str:
     """
     sys.stdout.write(prompt)
     sys.stdout.flush()
-    line = sys.stdin.readline()
+    stdin_buffer = getattr(sys.stdin, "buffer", None)
+    if stdin_buffer is not None:
+        raw_line = stdin_buffer.readline()
+        line = raw_line.decode("utf-8", errors="ignore")
+    else:
+        line = sys.stdin.readline()
     if not line:
         raise EOFError
     return line.rstrip("\n")

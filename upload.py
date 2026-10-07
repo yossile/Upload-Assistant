@@ -1102,6 +1102,15 @@ async def process_meta(meta: Meta, base_dir: str) -> bool:
     # same check as a defensive guard for tracker lists changed after this point.
     TrackerSetup(config=config).filter_unsupported_trackers(meta)
 
+    try:
+        scene_layout_confirmed = await helper.confirm_ptp_scene_layout(meta)
+    except EOFError:
+        logger.info("\n[red]Exiting on user request (Ctrl+C)[/red]")
+        return False
+    if not scene_layout_confirmed:
+        logger.info("[bold red]Skipping PTP scene upload.[/bold red]")
+        return False
+
     meta.name_notag, meta.name, meta.clean_name, meta.potential_missing = await name_manager.get_name(meta)
 
     logger.debug(f"Trackers list before editing: {meta.trackers}")

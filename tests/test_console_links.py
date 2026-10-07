@@ -1,10 +1,23 @@
 # ruff: noqa: S101
 import asyncio
+import io
 from io import StringIO
 
 from rich.console import Console
 
-from src.console import ansi_to_html, buffer_console_logs, prompt_in_thread
+from src.console import _safe_input, ansi_to_html, buffer_console_logs, prompt_in_thread
+
+
+class ByteInput:
+    def __init__(self, value: bytes) -> None:
+        self.buffer = io.BytesIO(value)
+
+
+def test_safe_input_ignores_dangling_utf8_byte_after_multibyte_character_is_deleted(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("src.console.sys.stdin", ByteInput(b"\xd7y\n"))
+
+    assert _safe_input("> ") == "y"
+    assert capsys.readouterr().out == "> "
 
 
 def test_ansi_to_html_preserves_osc8_hyperlinks() -> None:

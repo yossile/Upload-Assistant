@@ -15,6 +15,7 @@ import cli_ui
 from rich.markup import escape
 
 from src.audible import resolve_audible_url
+from src.artwork import select_ptp_cover_url
 from src.bdinfo_comparator import compare_bdinfo, has_bdinfo_content
 from src.cleanup import cleanup_manager
 from src.cogs.redaction import Redaction
@@ -270,6 +271,18 @@ class UploadHelper:
             return await prompt_in_thread(cli_ui.ask_yes_no, question, default=default)
         async with self._prompt_lock:
             return await prompt_in_thread(cli_ui.ask_yes_no, question, default=default)
+
+    async def confirm_ptp_scene_layout(self, meta: Meta) -> bool:
+        trackers = meta.trackers if isinstance(meta.trackers, list) else [meta.trackers]
+        is_ptp_selected = any(Meta.canonical_tracker_name(str(tracker)) == "PASSTHEPOPCORN" for tracker in trackers)
+        if not meta.scene or not is_ptp_selected or (meta.isdir and meta.keep_folder):
+            return True
+
+        question = "This is a PTP scene release, but the input is not being kept as a folder named after the scene RAR. Continue anyway?"
+        if meta.unattended and not bool(getattr(meta, "unattended_confirm", False)):
+            logger.warning(f"[yellow]{question} Skipping this item because unattended mode cannot confirm.[/yellow]")
+            return False
+        return await self.prompt_yes_no(question, default=False)
 
     async def dupe_check(self, dupes: list[DupeEntry | str], meta: Meta, tracker_name: str) -> tuple[bool, Meta]:
         """Show duplicate results and their confirmation as one atomic console interaction."""
@@ -698,6 +711,11 @@ class UploadHelper:
                 lines.append(("TMDB", f"https://www.themoviedb.org/{(meta.category or '').lower()}/{meta.tmdb_id}"))
             if meta.imdb_tt:
                 lines.append(("IMDB", f"https://www.imdb.com/title/{meta.imdb_tt}"))
+            selected_trackers = meta.trackers if isinstance(meta.trackers, list) else [meta.trackers]
+            if "PASSTHEPOPCORN" in selected_trackers:
+                cover_to_use = select_ptp_cover_url(meta)
+                if cover_to_use is not None:
+                    lines.append(("PTP Cover", cover_to_use))
             if meta.tvdb_id or 0 != 0:
                 lines.append(("TVDB", f"https://www.thetvdb.com/?id={meta.tvdb_id}&tab=series"))
             if meta.tvmaze_id or 0 != 0:

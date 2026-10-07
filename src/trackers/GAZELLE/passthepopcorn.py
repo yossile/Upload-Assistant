@@ -15,7 +15,9 @@ import cli_ui
 import click
 import httpx
 from rich.markup import escape
+from torf import Torrent
 
+from src.artwork import select_ptp_cover_url
 from src.bbcode import BBCODE
 from src.cogs.redaction import PathAwareEncoder, Redaction
 from src.console import logger, prompt_in_thread
@@ -1605,13 +1607,9 @@ class PassThePopcorn:
                     )
                 )
                 meta.youtube = youtube
-            cover = meta.imdb_info.get("cover")
-            if cover is None:
-                cover = meta.artwork_url
-            if isinstance(cover, str) and cover.strip():
+            cover = select_ptp_cover_url(meta)
+            if cover is not None:
                 cover = await self.rehost_poster_to_selected_host(meta, cover)
-            elif isinstance(cover, str):
-                cover = None
             while cover is None:
                 if meta.unattended and not meta.unattended_confirm:
                     meta.skipping = self.tracker
@@ -1671,10 +1669,23 @@ class PassThePopcorn:
         # PTP doesn't use a custom releasename in the upload form, so just return the filename
         return meta.name
 
+    @staticmethod
+    def _find_non_ascii_torrent_paths(torrent: Torrent) -> list[str]:
+        paths = [torrent.name, *(str(path) for path in torrent.files)]
+        return list(dict.fromkeys(path for path in paths if not path.isascii()))
+
     async def upload(self, meta: Meta, url: str, data: dict[str, Any]) -> bool:
         common = Common(config=self.config)
         torrent_file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}].torrent"
         await common.create_torrent_for_upload(meta, self.tracker, self.source_flag)
+
+        invalid_paths = self._find_non_ascii_torrent_paths(Torrent.read(torrent_file_path))
+        if invalid_paths:
+            paths = ", ".join(repr(path) for path in invalid_paths)
+            raise UploadError(
+                f"{self.display_name} cannot upload torrent paths containing non-ASCII characters: {paths}. "
+                "Rename the files to use ASCII characters and recreate the torrent."
+            )
 
         # Proceed with the upload process
         async with aiofiles.open(torrent_file_path, "rb") as torrent_file_handle:

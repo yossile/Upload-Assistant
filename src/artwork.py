@@ -38,6 +38,20 @@ def is_public_http_url(value: str | None) -> bool:
         return False
 
 
+def select_ptp_cover_url(meta: Meta) -> str | None:
+    """Choose the cover URL PTP should use, respecting an explicit poster URL."""
+    explicit_poster = str(meta.explicit_poster or "").strip()
+    if is_public_http_url(explicit_poster):
+        return explicit_poster
+    for cover in (meta.imdb_info.get("cover"), meta.artwork_url):
+        if isinstance(cover, str) and cover.strip():
+            return cover
+    poster_path = meta.tmdb_poster_path.strip()
+    if poster_path:
+        return f"https://image.tmdb.org/t/p/original{poster_path}"
+    return None
+
+
 def is_valid_image_bytes(image_bytes: bytes) -> bool:
     """Return whether bytes contain a decodable, non-empty supported image."""
     if not image_bytes:

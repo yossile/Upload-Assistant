@@ -1,11 +1,50 @@
 import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from bin.get_mkbrr import MkbrrBinaryManager
 from src.meta import Meta
 from src.torrentcreate import TorrentCreator
+
+
+@pytest.mark.asyncio
+async def test_mkbrr_preserves_keep_folder_root(tmp_path: Path) -> None:
+    release_dir = tmp_path / "susan.2025.1080p.web.h264-grashopr"
+    release_dir.mkdir()
+    video = release_dir / "susan.2025.1080p.web.h264-grashopr.mkv"
+    video.write_bytes(b"video")
+    meta = Meta(
+        base_dir=str(tmp_path),
+        category="MOVIE",
+        filelist=[str(video)],
+        keep_folder=True,
+        mkbrr=True,
+        mkbrr_threads="0",
+        path=str(release_dir),
+        trackers=["PASSTHEPOPCORN"],
+        uuid="test",
+    )
+
+    class FakeProcess:
+        def __init__(self, command: list[str]) -> None:
+            self.command = command
+        stdout = iter(["Wrote test.torrent\n"])
+
+        def wait(self) -> int:
+            output_path = Path(self.command[self.command.index("-o") + 1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.touch()
+            return 0
+
+    with patch("src.torrentcreate.subprocess.Popen", side_effect=lambda command, **_: FakeProcess(command)) as popen:
+        await TorrentCreator.create_torrent(meta, meta.path, "TEST")
+
+    command = popen.call_args.args[0]
+    assert "--include" in command
+    include = command[command.index("--include") + 1]
+    assert include == video.name
 
 
 @pytest.mark.asyncio

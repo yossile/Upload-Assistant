@@ -1,0 +1,24 @@
+{
+  "defaults": {
+    "base": "base:9bdb115590a615c0a6b64df102786361af6dac31"
+  },
+  "selections": {
+    "PASSTHEPOPCORN": "base:9bdb115590a615c0a6b64df102786361af6dac31",
+    "PASSTHEPOPCORN_DEBUG": "base:9bdb115590a615c0a6b64df102786361af6dac31"
+  },
+  "torrents": {
+    "base:9bdb115590a615c0a6b64df102786361af6dac31": {
+      "client_infohash": "835a6add94a907018085343b05478261a71068a3",
+      "content_size": 2252704410,
+      "file": "torrents/2097152/9bdb115590a615c0a6b64df102786361af6dac31.torrent",
+      "id": "base:9bdb115590a615c0a6b64df102786361af6dac31",
+      "infohash": "9bdb115590a615c0a6b64df102786361af6dac31",
+      "layout": "base",
+      "metainfo_size": 21802,
+      "origin": "client:UM790",
+      "piece_count": 1075,
+      "piece_size": 2097152
+    }
+  },
+  "version": 1
+}

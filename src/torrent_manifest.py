@@ -221,3 +221,11 @@ class TorrentManifest:
         except TypeError, ValueError:
             return None
         return path if path.is_file() else None
+
+    def clear_default(self, layout: TorrentLayout = "base") -> None:
+        with self._lock:
+            manifest = self._load()
+            defaults = cast(dict[str, Any], manifest["defaults"])
+            if layout in defaults:
+                defaults.pop(layout)
+                self._save(manifest)
