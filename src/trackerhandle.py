@@ -326,15 +326,21 @@ async def process_trackers(
                 try:
                     ptp = PassThePopcorn(config=config)
                     group_id = meta.ptp_groupid
+                    image_hosts_started_at = time.perf_counter()
                     await check_tracker_image_hosts(meta, ptp)
+                    logger.debug(f"[PTP timing] image host checks: {time.perf_counter() - image_hosts_started_at:.2f}s")
+                    form_started_at = time.perf_counter()
                     ptp_url, ptp_data = await ptp.fill_upload_form(group_id, meta)
+                    logger.debug(f"[PTP timing] upload form preparation: {time.perf_counter() - form_started_at:.2f}s")
                     is_uploaded = False
                     try:
-                        upload_start_time = time.monotonic()
+                        upload_start_time = time.perf_counter()
                         try:
                             is_uploaded = await ptp.upload(meta, ptp_url, ptp_data)
                         finally:
-                            meta[f"{tracker}_upload_duration"] = time.monotonic() - upload_start_time
+                            upload_duration = time.perf_counter() - upload_start_time
+                            meta[f"{tracker}_upload_duration"] = upload_duration
+                            logger.debug(f"[PTP timing] torrent preparation and submission: {upload_duration:.2f}s")
                     except Exception as e:
                         logger.info(f"[red]Upload failed: {escape(str(e))}[/red]")
                         logger.info(traceback.format_exc(), extra={"markup": False})
@@ -342,7 +348,9 @@ async def process_trackers(
                     status = meta.tracker_status.setdefault(ptp.tracker, {})
                     if is_uploaded and "data error" not in str(status.get("status_message", "")):
                         status["upload_success"] = True
+                        client_add_started_at = time.perf_counter()
                         await client.add_to_client(meta, "PASSTHEPOPCORN")
+                        logger.debug(f"[PTP timing] add to torrent client: {time.perf_counter() - client_add_started_at:.2f}s")
                         print_tracker_result(tracker, ptp, status, True)
                     else:
                         status["upload_success"] = False

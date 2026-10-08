@@ -1040,6 +1040,17 @@ def xxx_min_successful_uploads(meta: Meta, min_successful_uploads: int) -> int:
     return min(min_successful_uploads, max(1, contact_sheet_count))
 
 
+def _ptp_selected(meta: Meta) -> bool:
+    selected = meta.trackers
+    trackers = selected.split(",") if isinstance(selected, str) else selected or []
+    return any(str(tracker).strip().upper() in {"PTP", "PASSTHEPOPCORN"} for tracker in trackers)
+
+
+def _log_ptp_timing(meta: Meta, stage: str, started_at: float) -> None:
+    if _ptp_selected(meta):
+        logger.debug(f"[PTP timing] {stage}: {time.perf_counter() - started_at:.2f}s")
+
+
 async def process_meta(meta: Meta, base_dir: str) -> bool:
     """Process the metadata for each queued path."""
     if not meta.imghost:
@@ -1059,12 +1070,15 @@ async def process_meta(meta: Meta, base_dir: str) -> bool:
             meta.unattended = True
             logger.info("[yellow]Running in Auto Mode")
     prep = Prep(screens=meta.screens, img_host=meta.imghost, config=config, publish_preview=_publish_webui_preview_target)
+    prep_started_at = time.perf_counter()
     try:
         meta = await prep.gather_prep(meta=meta, mode="cli")
     except Exception as e:
         logger.info(f"Error in gather_prep: {e}")
         logger.info(traceback.format_exc())
         return False
+    finally:
+        _log_ptp_timing(meta, "media preparation", prep_started_at)
 
     # Load covers.json if it exists and not already present in meta
     covers_file = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/covers.json"
@@ -1273,7 +1287,9 @@ async def process_meta(meta: Meta, base_dir: str) -> bool:
         except Exception as e:
             logger.warning(f"[yellow]Warning: Tracker validation encountered an error: {e}[/yellow]")
 
+        tracker_checks_started_at = time.perf_counter()
         successful_trackers = await TrackerStatusManager(config=config).process_all_trackers(meta)
+        _log_ptp_timing(meta, "tracker eligibility and duplicate checks", tracker_checks_started_at)
 
         if meta.trackers_pass is not None:
             try:
@@ -2849,6 +2865,7 @@ async def do_the_thing(base_dir: str) -> None:
                             # The final queue result is evaluated against ``meta``, not this
                             # per-flow copy, including when both flows run concurrently.
                             meta_torrent.tracker_status = meta.tracker_status
+                            ptp_upload_started_at = time.perf_counter()
                             await process_trackers(
                                 meta_torrent,
                                 config,
@@ -2859,6 +2876,7 @@ async def do_the_thing(base_dir: str) -> None:
                                 list(other_api_trackers),
                                 bandwidth_control=bandwidth_control,
                             )
+                            _log_ptp_timing(meta_torrent, "tracker processing", ptp_upload_started_at)
                             accumulate_upload_durations(meta, meta_torrent, torrent_trackers)
 
                     async def wait_before_usenet_upload(meta: Meta = meta) -> None:

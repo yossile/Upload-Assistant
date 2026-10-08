@@ -6,6 +6,7 @@ import io
 import json
 import platform
 import re
+import time
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
@@ -1489,7 +1490,9 @@ class PassThePopcorn:
 
     async def fill_upload_form(self, group_id: int | str | None, meta: Meta) -> tuple[str, dict[str, Any]]:
         resolution, other_resolution = self.get_resolution(meta)
+        description_started_at = time.perf_counter()
         await self.edit_desc(meta)
+        logger.debug(f"[PTP timing] description generation: {time.perf_counter() - description_started_at:.2f}s")
         file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}]DESCRIPTION.txt"
         desc = ""
         try:
@@ -1558,6 +1561,9 @@ class PassThePopcorn:
 
         logger.debug(f"{self.tracker}: ptp_trumpable: {ptp_trumpable}")
         logger.debug(f"{self.tracker}: ptp_subtitles: {ptp_subtitles}")
+        csrf_started_at = time.perf_counter()
+        anti_csrf_token = await self.get_anti_csrf_token(meta)
+        logger.debug(f"[PTP timing] session and CSRF token: {time.perf_counter() - csrf_started_at:.2f}s")
         data: dict[str, Any] = {
             "submit": "true",
             "remaster_year": "",
@@ -1574,7 +1580,7 @@ class PassThePopcorn:
             "nfo_text": "",
             "subtitles[]": ptp_subtitles,
             "trumpable[]": ptp_trumpable,
-            "AntiCsrfToken": await self.get_anti_csrf_token(meta),
+            "AntiCsrfToken": anti_csrf_token,
         }
         if data["remaster_year"] != "" or data["remaster_title"] != "":
             data["remaster"] = "on"
@@ -1595,10 +1601,13 @@ class PassThePopcorn:
         if group_id is None:  # If need to make new group
             url = f"{self.base_url}/upload.php"
             if data["imdb"] == "0":
+                metadata_started_at = time.perf_counter()
                 tinfo = await self.get_torrent_info_tmdb(meta)
             else:
                 imdb_value = meta.imdb or "0"
+                metadata_started_at = time.perf_counter()
                 tinfo = await self.get_torrent_info(imdb_value, meta)
+            logger.debug(f"[PTP timing] PTP title metadata lookup: {time.perf_counter() - metadata_started_at:.2f}s")
             if meta.youtube is None or "youtube" not in meta.youtube:
                 youtube = (
                     ""
@@ -1610,7 +1619,9 @@ class PassThePopcorn:
                 meta.youtube = youtube
             cover = select_ptp_cover_url(meta)
             if cover is not None:
+                poster_started_at = time.perf_counter()
                 cover = await self.rehost_poster_to_selected_host(meta, cover)
+                logger.debug(f"[PTP timing] poster download and hosting: {time.perf_counter() - poster_started_at:.2f}s")
             while cover is None:
                 if meta.unattended and not meta.unattended_confirm:
                     meta.skipping = self.tracker
@@ -1686,7 +1697,9 @@ class PassThePopcorn:
     async def upload(self, meta: Meta, url: str, data: dict[str, Any]) -> bool:
         common = Common(config=self.config)
         torrent_file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}].torrent"
+        torrent_started_at = time.perf_counter()
         await common.create_torrent_for_upload(meta, self.tracker, self.source_flag)
+        logger.debug(f"[PTP timing] torrent file creation: {time.perf_counter() - torrent_started_at:.2f}s")
 
         invalid_paths = self._find_non_ascii_torrent_paths(Torrent.read(torrent_file_path))
         if invalid_paths:
@@ -1713,7 +1726,9 @@ class PassThePopcorn:
             logger.debug(url)
             logger.debug(Redaction.redact_private_info(debug_data))
             meta.tracker_status[self.tracker]["status_message"] = "Debug mode enabled, not uploading."
+            debug_torrent_started_at = time.perf_counter()
             await common.create_torrent_for_upload(meta, f"{self.tracker}" + "_DEBUG", f"{self.tracker}" + "_DEBUG", announce_url="https://fake.tracker")
+            logger.debug(f"[PTP timing] debug torrent file creation: {time.perf_counter() - debug_torrent_started_at:.2f}s")
             return True  # Debug mode - simulated success
         failure_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}]PTP_upload_failure.html"
         from src.cookie_auth import find_cookie_file
@@ -1722,7 +1737,11 @@ class PassThePopcorn:
         raw_cookies = self.cookie_validator._load_cookies_dict_secure(cookiefile)  # pyright: ignore[reportPrivateUsage]
         cookies = {name: str(data.get("value", "")) for name, data in raw_cookies.items()}
         async with httpx.AsyncClient(cookies=cookies, timeout=60.0, follow_redirects=True) as client:
-            response = await client.post(url=url, data=data, headers=headers, files=files)
+            request_started_at = time.perf_counter()
+            try:
+                response = await client.post(url=url, data=data, headers=headers, files=files)
+            finally:
+                logger.debug(f"[PTP timing] upload HTTP request: {time.perf_counter() - request_started_at:.2f}s")
         logger.info(f"{self.tracker}: [cyan]{response.url}")
         responsetext = response.text
         error_message = self._extract_upload_error_message(responsetext)

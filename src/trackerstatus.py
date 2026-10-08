@@ -235,7 +235,9 @@ class TrackerStatusManager:
                             dupes = []
                     elif tracker_name == "PASSTHEPOPCORN":
                         ptp: Any = PassThePopcorn(config=self.config)
+                        checks_started_at = time.perf_counter()
                         should_continue = await self._run_additional_checks(tracker_name, ptp, local_meta, helper)
+                        logger.debug(f"[PTP timing] tracker-specific eligibility checks: {time.perf_counter() - checks_started_at:.2f}s")
                         if not should_continue:
                             local_tracker_status["skipped"] = True
                             local_meta.skipping = tracker_name
@@ -243,13 +245,17 @@ class TrackerStatusManager:
                         if not local_tracker_status["skipped"]:
                             search_started = time.monotonic()
                             try:
+                                group_lookup_started_at = time.perf_counter()
                                 if local_meta.get("imdb_id", 0):
                                     group_id = await ptp.get_group_by_imdb(local_meta["imdb"])
                                 else:
                                     group_id = await ptp.get_group_by_tmdb(local_meta["tmdb_id"])
+                                logger.debug(f"[PTP timing] group lookup: {time.perf_counter() - group_lookup_started_at:.2f}s")
                                 async with meta_lock:
                                     meta.ptp_groupid = group_id
+                                dupe_search_started_at = time.perf_counter()
                                 dupes = cast(list[Any], await ptp.search_existing(group_id or "", cast(dict[str, Any], local_meta)))
+                                logger.debug(f"[PTP timing] duplicate search: {time.perf_counter() - dupe_search_started_at:.2f}s")
                                 await record_event_async(
                                     "api", service=tracker_name, operation="search", outcome="success", duration_ms=(time.monotonic() - search_started) * 1000
                                 )

@@ -115,6 +115,13 @@ class Prep:
         self.takescreens_manager = TakeScreensManager(config)
 
     @staticmethod
+    def _log_ptp_timing(meta: Meta, stage: str, started_at: float) -> None:
+        selected = meta.trackers
+        trackers = selected.split(",") if isinstance(selected, str) else selected or []
+        if any(str(tracker).strip().upper() in {"PTP", "PASSTHEPOPCORN"} for tracker in trackers):
+            logger.debug(f"[PTP timing] {stage}: {time.perf_counter() - started_at:.2f}s")
+
+    @staticmethod
     def _resolve_book_filelist(
         meta: Meta,
         videoloc: str,
@@ -174,7 +181,9 @@ class Prep:
         await self._publish_initial_webui_snapshot(meta)
 
         # 2. Disc and Category Detection
+        stage_started_at = time.perf_counter()
         videoloc, bdinfo = await prep_helpers.detect_disc_and_category(self, meta)
+        self._log_ptp_timing(meta, "disc and category detection", stage_started_at)
 
         # Music has its own release-oriented metadata pipeline.  It must not flow
         # through video/media-info, TMDB, screenshots or episode handling. It
@@ -194,7 +203,9 @@ class Prep:
             return meta
 
         # 3. File information and basic media processing
+        stage_started_at = time.perf_counter()
         filename, untouched_filename, videopath, search_term, search_file_folder, mi, video = await prep_helpers.process_media_files(self, meta, videoloc, bdinfo)
+        self._log_ptp_timing(meta, "media info and file processing", stage_started_at)
 
         if meta.category == "XXX" and meta.screens > 0:
             _rows, _columns, max_videos = (
@@ -214,6 +225,7 @@ class Prep:
         # satisfy cutoff_screens. Do not generate local frames that would then
         # be discarded solely because that lookup has not completed yet.
         early_screenshots_task: asyncio.Task[Meta | None] | None = None
+        early_screenshots_started_at = time.perf_counter()
         if not meta.keep_images:
             early_screenshots_task = asyncio.create_task(self._capture_early_screenshots(meta.copy(), filename, videopath, bdinfo))
         else:
@@ -223,29 +235,41 @@ class Prep:
         prep_helpers.calculate_source_size(self, meta, videopath)
 
         # 5. Conformance and validation
+        stage_started_at = time.perf_counter()
         await prep_helpers.validate_media(self, meta)
+        self._log_ptp_timing(meta, "media validation", stage_started_at)
 
         # 6. Tracker and Existing Torrent Info
+        stage_started_at = time.perf_counter()
         await prep_helpers.process_trackers_and_torrent(self, meta, client, hash_ids, tracker_ids, search_term, search_file_folder)
+        self._log_ptp_timing(meta, "existing torrent and client lookup", stage_started_at)
 
         # These tasks only create local artifacts. Posting and tracker upload
         # decisions remain in the upload stage after duplicate checks.
         await restart_early_artifact_tasks(meta, client, self.config)
 
         # 7. Sonarr, Radarr and Metadata Searches
+        stage_started_at = time.perf_counter()
         await prep_helpers.search_metadata(
             self, meta, filename, untouched_filename, videopath, search_term, search_file_folder, use_sonarr, use_radarr, skip_tracker_descriptions, client, bdinfo, mi
         )
+        self._log_ptp_timing(meta, "metadata searches", stage_started_at)
 
         # 8. Set Final Metadata and tags
+        stage_started_at = time.perf_counter()
         await prep_helpers.finalize_metadata(self, meta, videopath, bdinfo, mi, filename, untouched_filename, video)
+        self._log_ptp_timing(meta, "metadata finalization", stage_started_at)
 
+        stage_started_at = time.perf_counter()
         await prepare_artwork(meta)
+        self._log_ptp_timing(meta, "artwork preparation", stage_started_at)
 
         if meta.category == "XXX":
             await self.takescreens_manager.xxx_fallback_cover(meta.filelist or [], meta.uuid, meta.base_dir, meta)
 
+        stage_started_at = time.perf_counter()
         await languages_manager.process_desc_language(meta)
+        self._log_ptp_timing(meta, "description language processing", stage_started_at)
 
         if meta.manual_overview:
             meta.overview = meta.manual_overview.strip()
@@ -259,6 +283,7 @@ class Prep:
         # helper; the existing upload-stage capture remains the fallback.
         if early_screenshots_task is not None:
             early_meta = await early_screenshots_task
+            self._log_ptp_timing(meta, "early screenshot generation (elapsed including overlap)", early_screenshots_started_at)
             if early_meta is not None:
                 if early_meta.tonemapped:
                     meta.tonemapped = True
