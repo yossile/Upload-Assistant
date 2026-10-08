@@ -14,6 +14,7 @@ import aiofiles
 import cli_ui
 import click
 import httpx
+from bs4 import BeautifulSoup
 from rich.markup import escape
 from torf import Torrent
 
@@ -1674,6 +1675,14 @@ class PassThePopcorn:
         paths = [torrent.name, *(str(path) for path in torrent.files)]
         return list(dict.fromkeys(path for path in paths if not path.isascii()))
 
+    @staticmethod
+    def _extract_upload_error_message(response_text: str) -> str:
+        alert = BeautifulSoup(response_text, "html.parser").select_one(".alert--error")
+        if alert is None:
+            return ""
+        message = re.sub(r"\s+", " ", alert.get_text(" ", strip=True))
+        return re.sub(r"\s+([.,!?;:])", r"\1", message)
+
     async def upload(self, meta: Meta, url: str, data: dict[str, Any]) -> bool:
         common = Common(config=self.config)
         torrent_file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}].torrent"
@@ -1716,17 +1725,11 @@ class PassThePopcorn:
             response = await client.post(url=url, data=data, headers=headers, files=files)
         logger.info(f"{self.tracker}: [cyan]{response.url}")
         responsetext = response.text
+        error_message = self._extract_upload_error_message(responsetext)
         # If the response contains our announce URL, then we are on the upload page and the upload wasn't successful.
         if responsetext.find(self.announce_url) != -1:
-            # Get the error message.
-            error_message = ""
-            match = re.search(r"""<div class="alert alert--error.*?>(.+?)</div>""", responsetext)
-            if match is not None:
-                error_message = match.group(1)
-
             async with aiofiles.open(failure_path, "w", encoding="utf-8") as f:
                 await f.write(responsetext)
-            meta.tracker_status[self.tracker]["status_message"] = f"data error: see {failure_path} | {error_message}"
 
         # URL format in case of successful upload: https://passthepopcorn.me/torrents.php?id=9329&torrentid=91868
         expected_host = urlparse(self.base_url).netloc
@@ -1734,7 +1737,10 @@ class PassThePopcorn:
         if match is None:
             async with aiofiles.open(failure_path, "w", encoding="utf-8") as f:
                 await f.write(responsetext)
-            meta.tracker_status[self.tracker]["status_message"] = f"data error: see {failure_path}"
+            status_message = f"data error: see {failure_path}"
+            if error_message:
+                status_message += f" | {error_message}"
+            meta.tracker_status[self.tracker]["status_message"] = status_message
             return False
 
         # having UA add the torrent link as a comment.

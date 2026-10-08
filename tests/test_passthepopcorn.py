@@ -130,6 +130,12 @@ def test_find_non_ascii_torrent_paths_allows_ascii_paths() -> None:
     assert PassThePopcorn._find_non_ascii_torrent_paths(torrent) == []  # noqa: S101
 
 
+def test_extract_upload_error_message_from_alert_html() -> None:
+    html = '<div class="alert alert--error"><div>Invalid piece size<br />See <a href="/upload.php">the rules</a>.</div></div>'
+
+    assert PassThePopcorn._extract_upload_error_message(html) == "Invalid piece size See the rules."  # noqa: S101
+
+
 def test_disc_menu_images_precede_movie_screenshots_in_description() -> None:
     tracker = object.__new__(PassThePopcorn)
     meta = Meta(
