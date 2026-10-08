@@ -18,7 +18,22 @@ GIB = KIB**3
 TIB = KIB**4
 PIECE_SIZE_MIN = 32 * KIB
 PIECE_SIZE_MAX = 128 * MIB
-PASSTHEPOPCORN_MAX_PIECE_SIZE = 8 * MIB
+PASSTHEPOPCORN_MAX_PIECE_SIZE = 16 * MIB
+
+# (minimum payload size, minimum allowed piece size, preferred piece size, maximum allowed piece size)
+_PTP_PIECE_SIZE_BANDS = (
+    (0, 32 * KIB, 32 * KIB, 256 * KIB),
+    (147 * MIB, 64 * KIB, 128 * KIB, 512 * KIB),
+    (256 * MIB, 128 * KIB, 256 * KIB, MIB),
+    (533 * MIB, 256 * KIB, 512 * KIB, 2 * MIB),
+    (int(1.08 * GIB), 512 * KIB, MIB, 4 * MIB),
+    (int(2.24 * GIB), MIB, 2 * MIB, 8 * MIB),
+    (int(4.65 * GIB), 2 * MIB, 4 * MIB, 16 * MIB),
+    (int(8.04 * GIB), 4 * MIB, 8 * MIB, 16 * MIB),
+    (int(16.68 * GIB), 4 * MIB, 16 * MIB, 16 * MIB),
+    (int(148.75 * GIB), 8 * MIB, 16 * MIB, 16 * MIB),
+    (int(257.04 * GIB), 16 * MIB, 16 * MIB, 16 * MIB),
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,7 @@ PieceSizeSelector = Callable[[int], int]
 class TorrentPolicy:
     """Declarative tracker limits plus optional exceptional rule functions."""
 
+    min_piece_size: int | None = None
     max_piece_size: int | None = None
     max_metainfo_size: int | None = None
     required_piece_size: int | None = None
@@ -55,6 +71,8 @@ class TorrentPolicy:
 
     def accepts(self, stats: TorrentStats) -> bool:
         if stats.piece_size < PIECE_SIZE_MIN:
+            return False
+        if self.min_piece_size is not None and stats.piece_size < self.min_piece_size:
             return False
         if self.max_piece_size is not None and stats.piece_size > self.max_piece_size:
             return False
@@ -68,7 +86,9 @@ class TorrentPolicy:
         if self.required_piece_size is not None:
             return self.required_piece_size
         if self.max_piece_size is not None:
-            return min(default_piece_size, self.max_piece_size)
+            default_piece_size = min(default_piece_size, self.max_piece_size)
+        if self.min_piece_size is not None:
+            default_piece_size = max(default_piece_size, self.min_piece_size)
         return default_piece_size
 
 
@@ -95,8 +115,26 @@ def _hdbits_validator(stats: TorrentStats) -> bool:
     return hdbits_pieces_allowed(stats.piece_size, stats.piece_count, stats.content_size)
 
 
+def _ptp_piece_size_band(content_size: int) -> tuple[int, int, int]:
+    band = _PTP_PIECE_SIZE_BANDS[0]
+    for candidate in _PTP_PIECE_SIZE_BANDS[1:]:
+        if content_size < candidate[0]:
+            break
+        band = candidate
+    return band[1:]
+
+
+def _ptp_validator(stats: TorrentStats) -> bool:
+    min_piece_size, _, max_piece_size = _ptp_piece_size_band(stats.content_size)
+    return min_piece_size <= stats.piece_size <= max_piece_size
+
+
+def _ptp_piece_size(content_size: int) -> int:
+    return _ptp_piece_size_band(content_size)[1]
+
+
 HDBITS_POLICY = TorrentPolicy(validator=_hdbits_validator, piece_size_selector=hdbits_piece_size)
-PASSTHEPOPCORN_POLICY = TorrentPolicy(max_piece_size=PASSTHEPOPCORN_MAX_PIECE_SIZE)
+PASSTHEPOPCORN_POLICY = TorrentPolicy(validator=_ptp_validator, piece_size_selector=_ptp_piece_size)
 ANTHELION_POLICY = TorrentPolicy(max_metainfo_size=250 * KIB, required_piece_size=128 * MIB)
 
 
