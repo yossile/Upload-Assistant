@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from torf import Torrent
 
 from src.clients import Clients
@@ -9,6 +10,7 @@ from src.prep_helpers import _should_lookup_torrent_properties, process_trackers
 from src.torrent_manifest import TorrentManifest
 from src.torrent_policy import MIB, TorrentPolicy
 from src.torrentcreate import TorrentCreator
+from src.torrent_clients import qbittorrent as qbittorrent_module
 
 
 @pytest.mark.asyncio
@@ -383,6 +385,151 @@ async def test_qbit_search_returns_all_valid_matches_when_collecting(tmp_path, m
     found = await clients.search_qbit_for_torrent(meta, client, qbt_client=qbt_client, collect_all=True)
 
     assert found == hashes  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_completed_qbit_preflight_cache_is_reused_without_listing_again(tmp_path, monkeypatch):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    (storage / "completed-hash.torrent").touch()
+    media = tmp_path / "release.mkv"
+    client_config = {"torrent_client": "qbit", "enable_search": True, "torrent_storage_dir": str(storage)}
+    config = {"DEFAULT": {"default_torrent_client": "qbit"}, "TORRENT_CLIENTS": {"qbit": client_config}}
+    clients = Clients(config)
+    torrent = SimpleNamespace(
+        hash="completed-hash",
+        name="release",
+        save_path=str(tmp_path),
+        content_path=str(media),
+        state="seeding",
+        progress=1.0,
+        tracker="",
+        trackers=[],
+        comment="metadata",
+    )
+
+    async def init_client(_client):
+        return object()
+
+    async def fetch_results(_meta, _qbt_client, _qbt_session, _proxy_url):
+        return [torrent]
+
+    async def valid_torrent(_meta, path, _torrent_hash, _torrent_client, _client):
+        return True, str(path)
+
+    monkeypatch.setattr(clients, "init_qbittorrent_client", init_client)
+    monkeypatch.setattr(clients, "_fetch_qbit_search_results", fetch_results)
+    monkeypatch.setattr(clients, "is_valid_torrent", valid_torrent)
+    meta = Meta(base_dir=str(tmp_path), uuid="release", path=str(media), filelist=[str(media)], subtitle_files=[])
+    await clients.preflight_qbittorrent_search(meta, ["infohash", "torrent_hash", "skip_auto_torrent"])
+
+    qbt_client = SimpleNamespace(torrents_info=lambda: pytest.fail("cached results should avoid a second list call"))
+    found = await clients.search_qbit_for_torrent(meta, client_config, qbt_client=qbt_client, collect_all=True)
+
+    assert found == ["completed-hash"]  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_incomplete_qbit_preflight_waits_for_matching_hash(tmp_path, monkeypatch):
+    client_config = {"torrent_client": "qbit", "enable_search": True}
+    clients = Clients({"DEFAULT": {"default_torrent_client": "qbit"}, "TORRENT_CLIENTS": {"qbit": client_config}})
+    torrent = SimpleNamespace(hash="downloading-hash", name="release", content_path=str(tmp_path / "release"), state="downloading", progress=0.5)
+    waited_for = []
+
+    async def init_client(_client):
+        return object()
+
+    async def fetch_results(_meta, _qbt_client, _qbt_session, _proxy_url):
+        return [torrent]
+
+    async def wait_for_download(client, torrent_hash):
+        waited_for.append((client, torrent_hash))
+
+    monkeypatch.setattr(clients, "init_qbittorrent_client", init_client)
+    monkeypatch.setattr(clients, "_fetch_qbit_search_results", fetch_results)
+    monkeypatch.setattr(clients, "_wait_for_qbittorrent_download", wait_for_download)
+    meta = Meta(base_dir=str(tmp_path), uuid="release", path=str(tmp_path / "release"))
+
+    await clients.preflight_qbittorrent_search(meta, ["infohash", "torrent_hash", "skip_auto_torrent"])
+
+    assert waited_for == [(client_config, "downloading-hash")]  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_qbit_wait_polls_only_the_matching_hash_until_complete(monkeypatch):
+    states = iter([SimpleNamespace(state="downloading", progress=0.5), SimpleNamespace(state="seeding", progress=1.0)])
+    queried_hashes = []
+    qbt_client = SimpleNamespace(torrents_info=lambda **kwargs: queried_hashes.append(kwargs["hashes"]) or [next(states)])
+    clients = Clients({"DEFAULT": {}, "TORRENT_CLIENTS": {}})
+
+    async def init_client(_client):
+        return qbt_client
+
+    async def retry(operation, *_args, **_kwargs):
+        return await operation()
+
+    async def no_wait(_interval):
+        return None
+
+    printed = []
+
+    def capture_print(*objects, **kwargs):
+        if objects and isinstance(objects[0], str):
+            printed.append((objects[0], kwargs))
+
+    monkeypatch.setattr(clients, "init_qbittorrent_client", init_client)
+    monkeypatch.setattr(clients, "retry_qbt_operation", retry)
+    monkeypatch.setattr("src.torrent_clients.qbittorrent.asyncio.sleep", no_wait)
+    monkeypatch.setattr(qbittorrent_module.console, "print", capture_print)
+
+    await clients._wait_for_qbittorrent_download({"torrent_client": "qbit"}, "matched-hash")
+
+    assert queried_hashes == ["matched-hash", "matched-hash"]  # noqa: S101
+    assert ["50.0%" in line for line, _ in printed] == [True, False]  # noqa: S101
+    assert "100.0%" in printed[-1][0]  # noqa: S101
+    assert all(kwargs.get("end") == "\r" for _, kwargs in printed)  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_qbit_proxy_wait_retries_timeout_until_torrent_completes(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ReadTimeout("proxy timed out", request=httpx.Request("GET", "https://proxy.invalid/api/v2/torrents/info"))
+            return SimpleNamespace(status_code=200, json=lambda: [{"state": "seeding", "progress": 1.0}])
+
+        async def aclose(self):
+            return None
+
+    session = FakeSession()
+    clients = Clients({"DEFAULT": {}, "TORRENT_CLIENTS": {}})
+
+    class FakeAsyncClient:
+        def __new__(cls, **_kwargs):
+            return session
+
+    async def no_wait(_interval):
+        return None
+
+    printed = []
+
+    def capture_print(*objects, **kwargs):
+        if objects and isinstance(objects[0], str):
+            printed.append((objects[0], kwargs))
+
+    monkeypatch.setattr(qbittorrent_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(clients, "create_ssl_context_for_client", lambda _client: None)
+    monkeypatch.setattr("src.torrent_clients.qbittorrent.asyncio.sleep", no_wait)
+    monkeypatch.setattr(qbittorrent_module.console, "print", capture_print)
+
+    await clients._wait_for_qbittorrent_download({"qui_proxy_url": "https://proxy.invalid"}, "matched-hash")
+
+    assert session.calls == 2  # noqa: S101
+    assert any("100.0%" in line for line, _kwargs in printed)  # noqa: S101
 
 
 @pytest.mark.asyncio

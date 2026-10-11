@@ -179,6 +179,9 @@ class Prep:
         # 1. Init metadata settings
         use_sonarr, use_radarr, client, skip_tracker_descriptions, hash_ids, tracker_ids = prep_helpers.init_meta(self, meta, mode)
         await self._publish_initial_webui_snapshot(meta)
+        preflight_search = getattr(client, "preflight_qbittorrent_search", None)
+        if preflight_search is not None:
+            await preflight_search(meta, hash_ids)
 
         # 2. Disc and Category Detection
         stage_started_at = time.perf_counter()

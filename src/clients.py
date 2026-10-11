@@ -27,10 +27,13 @@ defusedxml.xmlrpc.monkey_patch()
 
 
 class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, TransmissionClientMixin):
+    _qbit_search_results_cache: dict[tuple[int, str], list[Any]]
+
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialize torrent-client operations with the application config."""
         self.config = config
         self._tracker_comment_hosts: dict[str, tuple[str, ...]] | None = None
+        self._qbit_search_results_cache: dict[tuple[int, str], list[Any]] = {}
 
     @staticmethod
     def _client_infohash(candidate: str | Path, torrent: Torrent) -> str:

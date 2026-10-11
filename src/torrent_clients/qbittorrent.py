@@ -19,7 +19,7 @@ import qbittorrentapi
 from torf import Torrent
 
 from src.cogs.redaction import Redaction
-from src.console import logger
+from src.console import console, logger
 from src.meta import Meta
 from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_save_path, tracker_directory
 from src.torrentcreate import TorrentCreator
@@ -64,6 +64,189 @@ class QbittorrentClientMixin:
         if expected_path and content_path and os.path.normcase(os.path.normpath(content_path)) == os.path.normcase(os.path.normpath(expected_path)):
             return True
         return self._torrent_name_matches(str(getattr(torrent, "name", "") or ""), meta)
+
+    @staticmethod
+    def _qbit_torrent_is_complete(torrent: Any) -> bool:
+        torrent_data = cast(dict[str, Any], torrent) if isinstance(torrent, dict) else None
+        state_value = torrent_data.get("state") if torrent_data is not None else getattr(torrent, "state", None)
+        progress_value = torrent_data.get("progress", 0) if torrent_data is not None else getattr(torrent, "progress", 0)
+        state = str(state_value or "")
+        if state in {"pausedUP", "queuedUP", "seeding", "completed", "stalledUP", "uploading", "forcedUP"}:
+            return True
+        if state in {"checkingUP", "checkingDL", "checkingResumeData", "moving"}:
+            return False
+        try:
+            return float(progress_value or 0) >= 1.0
+        except TypeError, ValueError:
+            return False
+
+    async def _fetch_qbit_search_results(
+        self,
+        meta: Meta,
+        qbt_client: qbittorrentapi.Client | None,
+        qbt_session: httpx.AsyncClient | None,
+        proxy_url: str | None,
+    ) -> list[Any] | None:
+        if proxy_url:
+            if qbt_session is None:
+                return None
+            qbt_proxy_url = proxy_url.rstrip("/")
+            search_term = meta.uuid.replace("[", ".").replace("]", ".")
+            url = self._build_proxy_search_url(qbt_proxy_url, search_term, {"excludeStatus": []})
+            response = await qbt_session.get(url)
+            if response.status_code != 200:
+                logger.info(f"[bold red]Failed to get torrents list via proxy: {response.status_code}")
+                return None
+            response_data = cast(Any, response.json())
+            if isinstance(response_data, dict):
+                response_data_dict = cast(dict[str, Any], response_data)
+                torrents_data = response_data_dict.get("torrents", [])
+            elif isinstance(response_data, list):
+                torrents_data = cast(list[dict[str, Any]], response_data)
+            else:
+                torrents_data = []
+            return self._build_mock_torrents(torrents_data) if isinstance(torrents_data, list) else []
+
+        if qbt_client is None:
+            return None
+        return await self.retry_qbt_operation(lambda: asyncio.to_thread(qbt_client.torrents_info), "Get torrents list", initial_timeout=14.0)
+
+    async def preflight_qbittorrent_search(self, meta: Meta, hash_ids: list[str]) -> None:
+        """Fetch qBittorrent search results before media processing and wait for matching downloads."""
+        if meta.skip_auto_torrent or meta.edit or meta.tracker_ids or any(meta.get(hash_id) for hash_id in hash_ids):
+            return
+
+        requested_client = meta.client
+        if isinstance(requested_client, str) and requested_client != "none":
+            client_names = [requested_client]
+        else:
+            default_section = cast(dict[str, Any], self.config.get("DEFAULT", {}))
+            configured_value = default_section.get("searching_client_list", [])
+            configured = cast(list[Any], configured_value) if isinstance(configured_value, list) else []
+            client_names = [str(name) for name in configured if str(name) and str(name) != "none"]
+            default_client = str(default_section.get("default_torrent_client", "none"))
+            if not client_names and default_client != "none":
+                client_names = [default_client]
+
+        wait_candidates: list[tuple[dict[str, Any], str]] = []
+        has_completed_match = False
+        for client_name in client_names:
+            client_value = self.config.get("TORRENT_CLIENTS", {}).get(client_name)
+            if not isinstance(client_value, dict):
+                continue
+            client = cast(dict[str, Any], client_value)
+            if str(client.get("torrent_client", "")).lower() != "qbit" or not client.get("enable_search"):
+                continue
+
+            proxy_url = client.get("qui_proxy_url")
+            proxy_url = proxy_url if isinstance(proxy_url, str) and proxy_url else None
+            qbt_session: httpx.AsyncClient | None = None
+            try:
+                qbt_client: qbittorrentapi.Client | None = None
+                if proxy_url:
+                    ssl_context = self.create_ssl_context_for_client(client)
+                    qbt_session = httpx.AsyncClient(timeout=10.0, verify=ssl_context)
+                else:
+                    qbt_client = await self.init_qbittorrent_client(client)
+                    if qbt_client is None:
+                        continue
+
+                torrents = await self._fetch_qbit_search_results(meta, qbt_client, qbt_session, proxy_url)
+                if torrents is None:
+                    continue
+                cache = getattr(self, "_qbit_search_results_cache", None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    self._qbit_search_results_cache = cache
+                search_cache = cast(dict[tuple[int, str], list[Any]], cache)
+                search_cache[(id(client), str(meta.uuid))] = torrents
+
+                matching_torrents = [torrent for torrent in torrents if self._matches_qbit_content_path(torrent, meta)]
+                for torrent in matching_torrents:
+                    if self._qbit_torrent_is_complete(torrent):
+                        has_completed_match = True
+                        continue
+                    torrent_hash = getattr(torrent, "hash", None)
+                    if isinstance(torrent_hash, str) and torrent_hash:
+                        wait_candidates.append((client, torrent_hash))
+            except Exception as error:
+                logger.warning(f"[yellow]Early qBittorrent search failed for '{client_name}': {error}")
+            finally:
+                if qbt_session is not None:
+                    await qbt_session.aclose()
+
+        if wait_candidates and not has_completed_match:
+            client, torrent_hash = wait_candidates[0]
+            await self._wait_for_qbittorrent_download(client, torrent_hash)
+
+    async def _wait_for_qbittorrent_download(self, client: dict[str, Any], torrent_hash: str) -> None:
+        proxy_url_value = client.get("qui_proxy_url")
+        proxy_url = proxy_url_value.rstrip("/") if isinstance(proxy_url_value, str) and proxy_url_value else None
+        qbt_session: httpx.AsyncClient | None = None
+        qbt_client: qbittorrentapi.Client | None = None
+        if proxy_url:
+            ssl_context = self.create_ssl_context_for_client(client)
+            qbt_session = httpx.AsyncClient(timeout=10.0, verify=ssl_context)
+        else:
+            qbt_client = await self.init_qbittorrent_client(client)
+            if qbt_client is None:
+                raise RuntimeError("qBittorrent client is not initialized")
+
+        logger.info(f"[yellow]Matching qBittorrent torrent is still downloading; waiting for {torrent_hash} to complete.[/yellow]")
+        progress_displayed = False
+        proxy_retry_delay = 1
+        try:
+            while True:
+                if proxy_url:
+                    if qbt_session is None:
+                        raise RuntimeError("qBittorrent proxy session is not initialized")
+                    try:
+                        response = await qbt_session.get(f"{proxy_url}/api/v2/torrents/info", params={"hashes": torrent_hash})
+                        self._raise_for_proxy_response(response)
+                        torrent_data = cast(Any, response.json())
+                        torrents = cast(list[Any], torrent_data) if isinstance(torrent_data, list) else []
+                        torrent = torrents[0] if torrents else None
+                        proxy_retry_delay = 1
+                    except (httpx.TransportError, _RetryableProxyResponseError) as error:
+                        logger.warning(f"[yellow]qBittorrent proxy poll failed ({error}); retrying in {proxy_retry_delay}s.[/yellow]")
+                        await asyncio.sleep(proxy_retry_delay)
+                        proxy_retry_delay = min(proxy_retry_delay * 2, 30)
+                        continue
+                else:
+                    if qbt_client is None:
+                        raise RuntimeError("qBittorrent client is not initialized")
+                    torrents = await self.retry_qbt_operation(
+                        lambda: asyncio.to_thread(qbt_client.torrents_info, hashes=torrent_hash),
+                        f"Get torrent info for {torrent_hash}",
+                        initial_timeout=14.0,
+                    )
+                    torrent = next(iter(torrents), None)
+
+                if torrent is None:
+                    raise RuntimeError(f"Torrent {torrent_hash} disappeared from qBittorrent")
+                torrent_data = cast(dict[str, Any], torrent) if isinstance(torrent, dict) else None
+                state_value = torrent_data.get("state") if torrent_data is not None else getattr(torrent, "state", None)
+                progress_value = torrent_data.get("progress", 0) if torrent_data is not None else getattr(torrent, "progress", 0)
+                state = str(state_value or "unknown")
+                try:
+                    progress = min(max(float(progress_value or 0), 0.0), 1.0)
+                except (TypeError, ValueError):
+                    progress = 0.0
+                console.print(f"[yellow]qBittorrent download: {progress * 100:.1f}%[/yellow]", end="\r")
+                progress_displayed = True
+                if state in {"error", "missingFiles"}:
+                    raise RuntimeError(f"Torrent {torrent_hash} cannot complete; qBittorrent state is {state}")
+                if self._qbit_torrent_is_complete(torrent):
+                    console.print()
+                    progress_displayed = False
+                    logger.info(f"[green]Torrent {torrent_hash} has completed downloading.[/green]")
+                    return
+                await asyncio.sleep(1)
+        finally:
+            if progress_displayed:
+                console.print()
+            if qbt_session is not None:
+                await qbt_session.aclose()
 
     async def is_valid_torrent(self, meta: Meta, torrent_path: str, torrenthash: str, torrent_client: str, client: dict[str, Any]) -> tuple[bool, str]:
         raise NotImplementedError
@@ -452,68 +635,74 @@ class QbittorrentClientMixin:
             # **Step 1: Find correct torrents using content_path**
             matching_torrents: list[dict[str, Any]] = []
 
-            try:
-                if proxy_url:
-                    if qbt_session is None:
-                        logger.info("[bold red]Proxy session not initialized")
-                        return None
-                    qbt_proxy_url = proxy_url.rstrip("/")
-                    search_term = meta.uuid.replace("[", ".").replace("]", ".")
-                    # status is irrelevant here, since we only want an infohash to build from
-                    qui_filters: dict[str, list[str]] = {
-                        "status": [],
-                        "excludeStatus": [],
-                        "categories": [],
-                        "excludeCategories": [],
-                        "tags": [],
-                        "excludeTags": [],
-                        "trackers": [],
-                        "excludeTrackers": [],
-                    }
-                    url = self._build_proxy_search_url(qbt_proxy_url, search_term, qui_filters)
+            cache = cast(dict[tuple[int, str], list[Any]], getattr(self, "_qbit_search_results_cache", {}))
+            cached_torrents = cache.pop((id(client), str(meta.uuid)), None)
+            if cached_torrents is not None:
+                torrents = cached_torrents
+                logger.debug(f"[cyan]Using {len(torrents)} cached qBittorrent search results[/cyan]")
+            else:
+                try:
+                    if proxy_url:
+                        if qbt_session is None:
+                            logger.info("[bold red]Proxy session not initialized")
+                            return None
+                        qbt_proxy_url = proxy_url.rstrip("/")
+                        search_term = meta.uuid.replace("[", ".").replace("]", ".")
+                        # status is irrelevant here, since we only want an infohash to build from
+                        qui_filters: dict[str, list[str]] = {
+                            "status": [],
+                            "excludeStatus": [],
+                            "categories": [],
+                            "excludeCategories": [],
+                            "tags": [],
+                            "excludeTags": [],
+                            "trackers": [],
+                            "excludeTrackers": [],
+                        }
+                        url = self._build_proxy_search_url(qbt_proxy_url, search_term, qui_filters)
 
-                    logger.debug(f"[cyan]Searching qBittorrent via proxy: {Redaction.redact_private_info(url)}...")
+                        logger.debug(f"[cyan]Searching qBittorrent via proxy: {Redaction.redact_private_info(url)}...")
 
-                    search_started = time.perf_counter()
-                    response = await qbt_session.get(url)
-                    logger.debug(f"[cyan]qBittorrent proxy search response: status={response.status_code}, elapsed={time.perf_counter() - search_started:.2f}s[/cyan]")
-                    if response.status_code == 200:
-                        response_data = response.json()
+                        search_started = time.perf_counter()
+                        response = await qbt_session.get(url)
+                        logger.debug(f"[cyan]qBittorrent proxy search response: status={response.status_code}, elapsed={time.perf_counter() - search_started:.2f}s[/cyan]")
+                        if response.status_code == 200:
+                            response_data = response.json()
 
-                        torrents_data: list[dict[str, Any]]
-                        if isinstance(response_data, dict) and "torrents" in response_data:
-                            response_data_dict = cast(dict[str, Any], response_data)
-                            torrents_value = response_data_dict.get("torrents", [])
-                            torrents_data = cast(list[dict[str, Any]], torrents_value) if isinstance(torrents_value, list) else []
-                        elif isinstance(response_data, list):
-                            torrents_data = cast(list[dict[str, Any]], response_data)
-                        else:
-                            torrents_data = []
-
-                        if meta.debug:
-                            if torrents_data:
-                                logger.debug(f"[cyan]qBittorrent proxy search returned {len(torrents_data)} torrents for '{search_term}'")
+                            torrents_data: list[dict[str, Any]]
+                            if isinstance(response_data, dict) and "torrents" in response_data:
+                                response_data_dict = cast(dict[str, Any], response_data)
+                                torrents_value = response_data_dict.get("torrents", [])
+                                torrents_data = cast(list[dict[str, Any]], torrents_value) if isinstance(torrents_value, list) else []
+                            elif isinstance(response_data, list):
+                                torrents_data = cast(list[dict[str, Any]], response_data)
                             else:
-                                logger.debug("[cyan]No matching torrents found via proxy search")
+                                torrents_data = []
 
-                        torrents = self._build_mock_torrents(torrents_data)
-                    else:
-                        if response.status_code == 404:
-                            logger.debug(f"[yellow]No torrents found via proxy search for '[green]{search_term}' [yellow]Maybe tracker errors?")
+                            if meta.debug:
+                                if torrents_data:
+                                    logger.debug(f"[cyan]qBittorrent proxy search returned {len(torrents_data)} torrents for '{search_term}'")
+                                else:
+                                    logger.debug("[cyan]No matching torrents found via proxy search")
+
+                            torrents = self._build_mock_torrents(torrents_data)
                         else:
-                            logger.info(f"[bold red]Failed to get torrents list via proxy: {response.status_code}")
-                        return None
-                else:
-                    if qbt_client is None:
-                        logger.info("[bold red]qBittorrent client not initialized")
-                        return None
-                    torrents = await self.retry_qbt_operation(lambda: asyncio.to_thread(qbt_client.torrents_info), "Get torrents list", initial_timeout=14.0)
-            except TimeoutError:
-                logger.info("[bold red]Getting torrents list timed out after retries")
-                return None
-            except Exception as e:
-                logger.info(f"[bold red]Error getting torrents list: {e}")
-                return None
+                            if response.status_code == 404:
+                                logger.debug(f"[yellow]No torrents found via proxy search for '[green]{search_term}' [yellow]Maybe tracker errors?")
+                            else:
+                                logger.info(f"[bold red]Failed to get torrents list via proxy: {response.status_code}")
+                            return None
+                    else:
+                        if qbt_client is None:
+                            logger.info("[bold red]qBittorrent client not initialized")
+                            return None
+                        torrents = await self.retry_qbt_operation(lambda: asyncio.to_thread(qbt_client.torrents_info), "Get torrents list", initial_timeout=14.0)
+                except TimeoutError:
+                    logger.info("[bold red]Getting torrents list timed out after retries")
+                    return None
+                except Exception as e:
+                    logger.info(f"[bold red]Error getting torrents list: {e}")
+                    return None
 
             torrent_count = 0
             for torrent in torrents:
