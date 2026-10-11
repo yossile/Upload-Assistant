@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import fnmatch
+import glob
 import math
 import os
 import platform
@@ -225,6 +226,7 @@ class TorrentCreator:
                     piece_size = meta.max_piece_size
                 tracker_url = tracker_url or None
                 include: list[str] = []
+                mkbrr_include: list[str] | None = None
                 exclude: list[str] = []
 
                 is_subs = "BASE_SUBS" in output_filename
@@ -253,7 +255,9 @@ class TorrentCreator:
                         exclude = ["*.*", "*sample.mkv"]
                         meta.mkbrr = False
                     elif not meta.tv_pack:
-                        include = [Path(f).name for f in creation_filelist]
+                        folder_name = Path(str(path)).name
+                        include = [glob.escape(f"{folder_name}/{Path(f).name}") for f in creation_filelist]
+                        mkbrr_include = [glob.escape(Path(f).name) for f in creation_filelist]
                         exclude = ["*", "*/**"]
 
                 elif meta.isdir:
@@ -278,11 +282,11 @@ class TorrentCreator:
                         include = ["*.mkv", "*.mp4", "*.ts"] if not meta.is_disc else []
                     else:
                         folder_name = Path(str(path)).name
-                        include = [f"{folder_name}/{Path(f).name}" for f in creation_filelist]
+                        include = [glob.escape(f"{folder_name}/{Path(f).name}") for f in creation_filelist]
                         exclude = ["*", "*/**"]
                 elif is_subs:
                     folder_name = Path(path).name
-                    include = [f"{folder_name}/{Path(file).name}" for file in creation_filelist]
+                    include = [glob.escape(f"{folder_name}/{Path(file).name}") for file in creation_filelist]
                     exclude = ["*", "*/**"]
                 else:
                     exclude = ["*.*", "*sample.mkv", "!sample*.*"] if not meta.is_disc else []
@@ -356,7 +360,7 @@ class TorrentCreator:
                             cmd.extend(["--exclude", exclude_str])
 
                         if include:
-                            cmd.extend(["--include", ",".join(include)])
+                            cmd.extend(["--include", ",".join(mkbrr_include if mkbrr_include is not None else include)])
 
                         cmd.extend(["-o", str(output_path)])
                         logger.debug(f"[cyan]mkbrr cmd: {cmd}")
@@ -474,10 +478,13 @@ class TorrentCreator:
                     # subtitle files selected for this upload, never every subtitle
                     # matching an extension below the creation root.
                     root = Path(path).resolve()
+                    root_name = Path(path).name
                     selected_subtitles: list[str] = []
                     for subtitle_file in meta.subtitle_files:
                         try:
-                            selected_subtitles.append(Path(str(subtitle_file)).resolve().relative_to(root).as_posix())
+                            relative_subtitle = Path(str(subtitle_file)).resolve().relative_to(root)
+                            # torf matches paths including the torrent's root name.
+                            selected_subtitles.append(glob.escape((Path(root_name) / relative_subtitle).as_posix()))
                         except ValueError:
                             logger.warning(f"[yellow]Selected subtitle is outside torrent root and will be skipped: {subtitle_file}")
                     custom_include = list(dict.fromkeys([*custom_include, *selected_subtitles]))

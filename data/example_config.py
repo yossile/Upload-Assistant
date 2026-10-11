@@ -226,7 +226,7 @@ config: dict[str, Any] = {
         "prowlarr_api_key": "",
         # --- IMAGE HOSTING ---
         # Order of image hosts, with the primary host first and backups after it.
-        # Available image hosts: catbox, dalexni, imgbb, imgbox, lensdump, lostimg, midnightscene, onlyimage, passtheimage, pixhost, ptscreens, seedpool_cdn, sharex, utppm, zipline
+        # Available image hosts: catbox, dalexni, imgbb, imgbox, lensdump, lostimg, midnightscene, onlyimage, passtheimage, pixhost, ptscreens, seedpool_cdn, sharex, thrimg, utppm, zipline
         "img_host_1": "",
         "img_host_2": "",
         "img_host_3": "",
@@ -261,6 +261,7 @@ config: dict[str, Any] = {
         # ShareX-style image host (IMageHosting) token
         "sharex_url": "https://img.digitalcore.club/api/upload",
         "sharex_api_key": "",
+        "thrimg_api": "",
         # utp.pm API key
         "utppm_api": "",
         # Custom Zipline URL and API key
@@ -414,7 +415,7 @@ config: dict[str, Any] = {
         # Custom signature added to the bottom of the description.
         # Can be overridden per tracker by adding the same setting to its configuration.
         "custom_signature": "",
-        # Override description text fields for specific release groups. Tags are matched
+        # Override description presentation settings for specific release groups. Tags are matched
         # case-insensitively, with or without their leading hyphen.
         # Per-tracker tag_overrides take precedence over these DEFAULT overrides.
         "tag_overrides": {
@@ -427,6 +428,9 @@ config: dict[str, Any] = {
             #     "dynamic_hdr_plot_header": "[h2]MyAwesomeGroupTag Dynamic HDR Metadata[/h2]",
             #     "tonemapped_header": "[center]MyAwesomeGroupTag SDR reference screenshots[/center]",
             #     "custom_signature": "[center]MyAwesomeGroupTag signature[/center]",
+            #     "thumbnail_size": "400",
+            #     "screens_per_row": "3",
+            #     "episode_overview": False,
             # },
         },
         # --- BLU-RAY SETTINGS ---
@@ -550,7 +554,7 @@ config: dict[str, Any] = {
         #   DREADVAULT, DRUNKENSLUG, EMUWAREZ, FILELIST, FLOOD, FUNFILE, GREATPOSTERWALL, HAWKEUNO, HDBITS, HDSPACE, HDTORRENTS, HOMIEHELPDESK,
         #   IMMORTALSEED, INFINITYHD, IPTORRENTS, ITATORRENTS, LAJIDUI, LASTDIGITALUNDERGROUND, LATTEAM, LEMONHD, LOCADORA, LONGPT, LST,
         #   LUMINARR, MAKINGOFF, MIDNIGHTSCENE, MTEAM, NEBULANCE, NORDICQUALITY, NZBGEEK, NZBNEST, OLDTOONSWORLD, ONLYENCODES, ORPHEUS, PASSTHEPOPCORN,
-        #   PEERGARDEN, POLISHTORRENT, PORTUGAS, PRIVATEHD, PTCAFE, PTERCLUB, PTFANS, PTGTK, PTSKIT, PTZONE, RACING4EVERYONE, RAILGUNPT,
+        #   PEERGARDEN, POLISHTORRENT, PORTUGAS, PRIVATEHD, PTCAFE, PTERCLUB, PTFANS, PTGTK, PTSKIT, PTZONE, QINGWA, RACING4EVERYONE, RAILGUNPT,
         #   RASTASTUGAN, REELFLIX, RETROFLIX, RETROMOVIESCLUB, ROCKETHD, SAMARITANO, SEEDPOOL, SHAREISLAND, SKIPTHECOMMERCIALS, SPEEDAPP,
         #   SUIO, SWARMAZON, THELEACHZONE, THEOLDSCHOOL, TORRENTEROS, TORRENTHR, TORRENTLEECH, TOTHEGLORY, TVCHAOSUK, ULCX, UTOPIA,
         #   XINGYUNGEPT, YUSCENE, ZENITH
@@ -2574,6 +2578,39 @@ config: dict[str, Any] = {
             # Instead of using the tracker acronym for folder name when sym/hard linking, you can use a custom name
             "link_dir_name": "",
             # Cookies required (export from https://ptzone.xyz/ to data/cookies/PTZONE.txt).
+            # See: https://github.com/wastaken7/Upload-Assistant/blob/development/docs/example-config.md#how-to-export-cookies
+            "announce_url": "",
+            "anon": True,
+            # The configurations below override the DEFAULT configuration
+            "add_logo": True,
+            "logo_size": "",
+            "thumbnail_size": "",
+            "screens_per_row": "",
+            "episode_overview": True,
+            "multiScreens": "",
+            "pack_thumb_size": "",
+            "charLimit": "",
+            "fileLimit": "",
+            "processLimit": "",
+            "custom_description_header": "",
+            "screenshot_header": "",
+            "disc_menu_header": "",
+            "mediainfo_header": "",
+            "audio_spectrogram_header": "",
+            "custom_signature": "",
+            "user_description": "",
+            "custom_header": "",
+            "custom_footer": "",
+            "use_bluray_images": True,
+            "bluray_image_size": "",
+            "add_audio_spectrogram": True,
+            "inject_delay": 0,
+        },
+        "QINGWA": {
+            "cli_alias": "QW",
+            # Instead of using the tracker acronym for folder name when sym/hard linking, you can use a custom name
+            "link_dir_name": "",
+            # Cookies required (export from https://www.qingwapt.com/ to data/cookies/QINGWA.txt).
             # See: https://github.com/wastaken7/Upload-Assistant/blob/development/docs/example-config.md#how-to-export-cookies
             "announce_url": "",
             "anon": True,
