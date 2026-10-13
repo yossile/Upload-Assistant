@@ -18,6 +18,7 @@ from src.dupe_checking import DupeChecker
 from src.get_desc import DescriptionBuilder
 from src.manualpackage import ManualPackageManager
 from src.meta import Meta
+from src.ptp_timing import log_ptp_timing
 from src.qbitwait import Wait
 from src.rehostimages import check_tracker_image_hosts, has_restricted_image_hosts, select_common_image_host
 from src.stats import record_event_async
@@ -328,10 +329,10 @@ async def process_trackers(
                     group_id = meta.ptp_groupid
                     image_hosts_started_at = time.perf_counter()
                     await check_tracker_image_hosts(meta, ptp)
-                    logger.debug(f"[PTP timing] image host checks: {time.perf_counter() - image_hosts_started_at:.2f}s")
+                    log_ptp_timing(meta, "image host checks", image_hosts_started_at)
                     form_started_at = time.perf_counter()
                     ptp_url, ptp_data = await ptp.fill_upload_form(group_id, meta)
-                    logger.debug(f"[PTP timing] upload form preparation: {time.perf_counter() - form_started_at:.2f}s")
+                    log_ptp_timing(meta, "upload form preparation", form_started_at)
                     is_uploaded = False
                     try:
                         upload_start_time = time.perf_counter()
@@ -340,7 +341,7 @@ async def process_trackers(
                         finally:
                             upload_duration = time.perf_counter() - upload_start_time
                             meta[f"{tracker}_upload_duration"] = upload_duration
-                            logger.debug(f"[PTP timing] torrent preparation and submission: {upload_duration:.2f}s")
+                            log_ptp_timing(meta, "torrent preparation and submission", upload_start_time)
                     except Exception as e:
                         logger.info(f"[red]Upload failed: {escape(str(e))}[/red]")
                         logger.info(traceback.format_exc(), extra={"markup": False})
@@ -350,7 +351,7 @@ async def process_trackers(
                         status["upload_success"] = True
                         client_add_started_at = time.perf_counter()
                         await client.add_to_client(meta, "PASSTHEPOPCORN")
-                        logger.debug(f"[PTP timing] add to torrent client: {time.perf_counter() - client_add_started_at:.2f}s")
+                        log_ptp_timing(meta, "add to torrent client", client_add_started_at)
                         print_tracker_result(tracker, ptp, status, True)
                     else:
                         status["upload_success"] = False

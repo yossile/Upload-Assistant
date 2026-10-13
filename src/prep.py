@@ -11,6 +11,7 @@ from src.content_duration import populate_content_duration
 from src.meta import Meta
 from src.meta_file import write_meta_file
 from src.metadata_cache import set_run_disabled
+from src.ptp_timing import log_ptp_timing
 from src.screenshot_manifest import files as manifest_files
 from src.stats import stats_collection_enabled
 
@@ -119,7 +120,7 @@ class Prep:
         selected = meta.trackers
         trackers = selected.split(",") if isinstance(selected, str) else selected or []
         if any(str(tracker).strip().upper() in {"PTP", "PASSTHEPOPCORN"} for tracker in trackers):
-            logger.debug(f"[PTP timing] {stage}: {time.perf_counter() - started_at:.2f}s")
+            log_ptp_timing(meta, stage, started_at)
 
     @staticmethod
     def _resolve_book_filelist(

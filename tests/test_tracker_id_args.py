@@ -87,6 +87,15 @@ def test_trackers_pass_parsed_as_int(tmp_path):
     assert isinstance(meta.trackers_pass, int)
 
 
+def test_benchmark_flag_does_not_enable_debug_mode(tmp_path):
+    args = Args({"DEFAULT": {"screens": 1}})
+
+    meta, _, _ = args.parse([str(tmp_path), "-tk", "PTP", "--benchmark"], Meta())
+
+    assert meta.benchmark is True
+    assert meta.debug is False
+
+
 def test_numeric_cli_arguments_parsed_as_correct_types(tmp_path):
     config = {"DEFAULT": {"screens": 2}}
     args = Args(config)

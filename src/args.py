@@ -184,6 +184,7 @@ Common options:
   -comps, --comparison       Use comparison images from a folder (input folder path): see -comps_index
   -webui, --webui            Start the web UI server only (format: host:port, default: 127.0.0.1:5000)
   -debug, --debug            Prints more information, runs everything without actually uploading
+    --benchmark                Print PTP stage timings while uploading normally
 
 Use --help for a full list of options.
 """
@@ -904,6 +905,7 @@ class Args:
         parser.add_argument(
             "-debug", "--debug", action="store_true", required=False, help="Debug Mode, will run through all the motions providing extra info, but will not upload to trackers."
         )
+        parser.add_argument("--benchmark", action="store_true", required=False, help="Print granular PTP stage timings without changing upload behavior")
         parser.add_argument("-ffdebug", "--ffdebug", action="store_true", required=False, help="Will show info from ffmpeg while taking screenshots.")
         parser.add_argument(
             "-uptimer", "--upload-timer", action="store_true", required=False, help="Prints the time it takes to upload to each individual site.", dest="upload_timer"

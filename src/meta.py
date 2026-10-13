@@ -112,6 +112,7 @@ class Meta:
     current_version: str = ""
     cutoff: int = 1
     daily_episode_title: str = ""
+    benchmark: bool = False
     debug: bool = False
     delete_meta: bool = False
     delete_tmp: bool = False

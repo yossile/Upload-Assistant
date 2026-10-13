@@ -15,6 +15,7 @@ from src.dupe_checking import DupeChecker
 from src.imdb import imdb_manager
 from src.meta import Meta
 from src.metadata_searching import get_douban_id
+from src.ptp_timing import log_ptp_timing
 from src.stats import record_event_async
 from src.trackers.AVISTAZ.routing import AvistaZNetworkRouter
 from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
@@ -238,7 +239,7 @@ class TrackerStatusManager:
                         ptp: Any = PassThePopcorn(config=self.config)
                         checks_started_at = time.perf_counter()
                         should_continue = await self._run_additional_checks(tracker_name, ptp, local_meta, helper)
-                        logger.debug(f"[PTP timing] tracker-specific eligibility checks: {time.perf_counter() - checks_started_at:.2f}s")
+                        log_ptp_timing(local_meta, "tracker-specific eligibility checks", checks_started_at)
                         if not should_continue:
                             local_tracker_status["skipped"] = True
                             local_meta.skipping = tracker_name
@@ -251,12 +252,12 @@ class TrackerStatusManager:
                                     group_id = await ptp.get_group_by_imdb(local_meta["imdb"])
                                 else:
                                     group_id = await ptp.get_group_by_tmdb(local_meta["tmdb_id"])
-                                logger.debug(f"[PTP timing] group lookup: {time.perf_counter() - group_lookup_started_at:.2f}s")
+                                log_ptp_timing(local_meta, "group lookup", group_lookup_started_at)
                                 async with meta_lock:
                                     meta.ptp_groupid = group_id
                                 dupe_search_started_at = time.perf_counter()
                                 dupes = cast(list[Any], await ptp.search_existing(group_id or "", cast(dict[str, Any], local_meta)))
-                                logger.debug(f"[PTP timing] duplicate search: {time.perf_counter() - dupe_search_started_at:.2f}s")
+                                log_ptp_timing(local_meta, "duplicate search", dupe_search_started_at)
                                 await record_event_async(
                                     "api", service=tracker_name, operation="search", outcome="success", duration_ms=(time.monotonic() - search_started) * 1000
                                 )

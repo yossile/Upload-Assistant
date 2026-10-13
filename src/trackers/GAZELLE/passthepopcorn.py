@@ -28,6 +28,7 @@ from src.exceptions import *  # noqa F403
 from src.exceptions import UploadError
 from src.mediainfo import MediaInfo
 from src.meta import Meta
+from src.ptp_timing import log_ptp_timing
 from src.rehostimages import ImageHostPolicy, RehostImagesManager
 from src.screenshot_manifest import files as manifest_files
 from src.takescreens import TakeScreensManager
@@ -1492,7 +1493,7 @@ class PassThePopcorn:
         resolution, other_resolution = self.get_resolution(meta)
         description_started_at = time.perf_counter()
         await self.edit_desc(meta)
-        logger.debug(f"[PTP timing] description generation: {time.perf_counter() - description_started_at:.2f}s")
+        log_ptp_timing(meta, "description generation", description_started_at)
         file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}]DESCRIPTION.txt"
         desc = ""
         try:
@@ -1563,7 +1564,7 @@ class PassThePopcorn:
         logger.debug(f"{self.tracker}: ptp_subtitles: {ptp_subtitles}")
         csrf_started_at = time.perf_counter()
         anti_csrf_token = await self.get_anti_csrf_token(meta)
-        logger.debug(f"[PTP timing] session and CSRF token: {time.perf_counter() - csrf_started_at:.2f}s")
+        log_ptp_timing(meta, "session and CSRF token", csrf_started_at)
         data: dict[str, Any] = {
             "submit": "true",
             "remaster_year": "",
@@ -1607,7 +1608,7 @@ class PassThePopcorn:
                 imdb_value = meta.imdb or "0"
                 metadata_started_at = time.perf_counter()
                 tinfo = await self.get_torrent_info(imdb_value, meta)
-            logger.debug(f"[PTP timing] PTP title metadata lookup: {time.perf_counter() - metadata_started_at:.2f}s")
+            log_ptp_timing(meta, "PTP title metadata lookup", metadata_started_at)
             if meta.youtube is None or "youtube" not in meta.youtube:
                 youtube = (
                     ""
@@ -1621,7 +1622,7 @@ class PassThePopcorn:
             if cover is not None:
                 poster_started_at = time.perf_counter()
                 cover = await self.rehost_poster_to_selected_host(meta, cover)
-                logger.debug(f"[PTP timing] poster download and hosting: {time.perf_counter() - poster_started_at:.2f}s")
+                log_ptp_timing(meta, "poster download and hosting", poster_started_at)
             while cover is None:
                 if meta.unattended and not meta.unattended_confirm:
                     meta.skipping = self.tracker
@@ -1699,7 +1700,7 @@ class PassThePopcorn:
         torrent_file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}].torrent"
         torrent_started_at = time.perf_counter()
         await common.create_torrent_for_upload(meta, self.tracker, self.source_flag)
-        logger.debug(f"[PTP timing] torrent file creation: {time.perf_counter() - torrent_started_at:.2f}s")
+        log_ptp_timing(meta, "torrent file creation", torrent_started_at)
 
         invalid_paths = self._find_non_ascii_torrent_paths(Torrent.read(torrent_file_path))
         if invalid_paths:
@@ -1728,7 +1729,7 @@ class PassThePopcorn:
             meta.tracker_status[self.tracker]["status_message"] = "Debug mode enabled, not uploading."
             debug_torrent_started_at = time.perf_counter()
             await common.create_torrent_for_upload(meta, f"{self.tracker}" + "_DEBUG", f"{self.tracker}" + "_DEBUG", announce_url="https://fake.tracker")
-            logger.debug(f"[PTP timing] debug torrent file creation: {time.perf_counter() - debug_torrent_started_at:.2f}s")
+            log_ptp_timing(meta, "debug torrent file creation", debug_torrent_started_at)
             return True  # Debug mode - simulated success
         failure_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}]PTP_upload_failure.html"
         from src.cookie_auth import find_cookie_file
@@ -1741,7 +1742,7 @@ class PassThePopcorn:
             try:
                 response = await client.post(url=url, data=data, headers=headers, files=files)
             finally:
-                logger.debug(f"[PTP timing] upload HTTP request: {time.perf_counter() - request_started_at:.2f}s")
+                log_ptp_timing(meta, "upload HTTP request", request_started_at)
         logger.info(f"{self.tracker}: [cyan]{response.url}")
         responsetext = response.text
         error_message = self._extract_upload_error_message(responsetext)

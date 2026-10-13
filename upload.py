@@ -117,6 +117,7 @@ from src.temp_paths import artwork_dir, music_release_snapshot_path, screenshots
 from src.torrent_manifest import TorrentManifest
 from src.torrentcreate import TorrentCreator
 from src.trackerhandle import process_trackers
+from src.ptp_timing import log_ptp_timing
 from src.trackers.common import Common
 from src.trackers.GAZELLE.alpharatio import AlphaRatio
 from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
@@ -1059,7 +1060,7 @@ def _ptp_selected(meta: Meta) -> bool:
 
 def _log_ptp_timing(meta: Meta, stage: str, started_at: float) -> None:
     if _ptp_selected(meta):
-        logger.debug(f"[PTP timing] {stage}: {time.perf_counter() - started_at:.2f}s")
+        log_ptp_timing(meta, stage, started_at)
 
 
 async def process_meta(meta: Meta, base_dir: str) -> bool:
