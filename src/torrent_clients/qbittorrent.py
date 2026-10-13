@@ -113,7 +113,7 @@ class QbittorrentClientMixin:
 
     async def preflight_qbittorrent_search(self, meta: Meta, hash_ids: list[str]) -> None:
         """Fetch qBittorrent search results before media processing and wait for matching downloads."""
-        if meta.skip_auto_torrent or meta.edit or meta.tracker_ids or any(meta.get(hash_id) for hash_id in hash_ids):
+        if meta.source_torrent_hash or meta.skip_auto_torrent or meta.edit or meta.tracker_ids or any(meta.get(hash_id) for hash_id in hash_ids):
             return
 
         requested_client = meta.client
@@ -253,6 +253,20 @@ class QbittorrentClientMixin:
 
     async def get_ptp_from_hash_qbit(self, meta: Meta, client: dict[str, Any], pathed: bool = False) -> Meta:
         lookup_started = time.perf_counter()
+        info_hash_v1 = meta.infohash
+        if not isinstance(info_hash_v1, str) or not info_hash_v1 or not meta.path:
+            return meta
+
+        if pathed and meta.source_torrent_hash and meta.source_torrent_hash.lower() == info_hash_v1.lower():
+            torrent_comments = meta.torrent_comments if isinstance(meta.torrent_comments, list) else []
+            for torrent_comment in torrent_comments:
+                if not isinstance(torrent_comment, dict) or str(torrent_comment.get("hash", "")).lower() != info_hash_v1.lower():
+                    continue
+                comment = str(torrent_comment.get("comment", "") or "")
+                meta.set_tracker_ids(self._extract_tracker_ids_from_comment(comment))
+                logger.debug(f"[cyan]Using comment from the initial qBittorrent info response for hash: {info_hash_v1}[/cyan]")
+                return meta
+
         proxy_url = client.get("qui_proxy_url")
         qbt_proxy_url = ""
         qbt_client: qbittorrentapi.Client | None = None
@@ -269,9 +283,6 @@ class QbittorrentClientMixin:
                 return meta
             qbt_client = potential_qbt_client
 
-        info_hash_v1 = meta.infohash
-        if not isinstance(info_hash_v1, str) or not info_hash_v1 or not meta.path:
-            return meta
         logger.debug(f"[cyan]Searching for infohash: {info_hash_v1}")
         logger.debug(f"[cyan]Fetching qBittorrent properties ({'proxy' if proxy_url else 'direct'}, pathed={pathed})[/cyan]")
 

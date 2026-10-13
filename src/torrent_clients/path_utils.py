@@ -68,6 +68,27 @@ def map_save_path(
     return mapped_path if mapped_path.endswith("/") else f"{mapped_path}/"
 
 
+def map_remote_to_local_path(
+    remote_path: str | Path,
+    local_paths: list[str],
+    remote_paths: list[str],
+) -> str:
+    """Map a client path back to its paired local root when configured."""
+    remote_path_str = str(remote_path)
+    for index, remote_root in enumerate(remote_paths):
+        relative_parts = _relative_path_parts(remote_path_str, remote_root)
+        if relative_parts is None:
+            continue
+
+        local_root = local_paths[index] if index < len(local_paths) else local_paths[0]
+        mapped_path = Path(local_root)
+        if relative_parts:
+            mapped_path /= Path(*relative_parts)
+        return str(mapped_path)
+
+    return remote_path_str
+
+
 def tracker_directory(link_target: str | Path, link_dir_name: str, tracker: str) -> Path:
     """Build a safe tracker link directory and reject unsafe Windows names."""
     directory_name = link_dir_name.strip() or tracker

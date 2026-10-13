@@ -9,11 +9,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import bencode
 import pytest
+from qbittorrentapi.torrents import TorrentInfoList
 from torf import Torrent
 
 from src.clients import Clients
 from src.meta import Meta
-from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_save_path, tracker_directory
+from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_remote_to_local_path, map_save_path, tracker_directory
 from src.torrent_clients.qbittorrent import _link_torrent_files, create_cross_seed_links
 
 
@@ -197,6 +198,244 @@ def test_map_save_path_does_not_rewrite_sibling_paths() -> None:
 def test_map_save_path_preserves_case_insensitive_mapping_and_client_format() -> None:
     assert map_save_path("/Local/Release", "/local", "/remote") == "/remote/Release/"
     assert map_save_path("/local/Release", "/local", "/remote", trailing_slash=False) == "/remote/Release"
+
+
+def test_map_remote_to_local_path_uses_paired_roots_and_path_boundaries() -> None:
+    assert map_remote_to_local_path("/remote-b/Release/movie.mkv", ["/local-a", "/local-b"], ["/remote-a", "/remote-b"]) == "/local-b/Release/movie.mkv"
+    assert map_remote_to_local_path("/remote-bak/Release", ["/local-a"], ["/remote-b"]) == "/remote-bak/Release"
+
+
+@pytest.mark.asyncio
+async def test_resolve_qbittorrent_hash_path_maps_content_path(tmp_path: Path) -> None:
+    media = tmp_path / "downloads" / "Release" / "movie.mkv"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"media")
+    infohash = "a" * 40
+    client = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "TORRENT_CLIENTS": {
+                "qbit": {
+                    "torrent_client": "qbit",
+                    "local_path": str(tmp_path / "downloads"),
+                    "remote_path": "/remote/downloads",
+                }
+            },
+        }
+    )
+    def torrents_info(**kwargs):
+        assert kwargs == {"torrent_hashes": infohash}
+        return TorrentInfoList(
+            [
+                {
+                    "hash": infohash,
+                    "content_path": "/remote/downloads/Release/movie.mkv",
+                    "save_path": "",
+                    "name": "Release",
+                    "state": "seeding",
+                    "progress": 1.0,
+                    "comment": "comment from info response",
+                }
+            ]
+        )
+
+    qbt_client = SimpleNamespace(torrents_info=torrents_info)
+    with patch.object(client, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)):
+        meta = Meta(base_dir=str(tmp_path), uuid="Release")
+        resolved = await client.resolve_qbittorrent_hash_path(meta, infohash)
+
+    assert resolved == str(media)
+    assert meta.source_torrent_hash == infohash
+    assert meta.torrent_comments == [{"hash": infohash, "name": "Release", "comment": "comment from info response"}]
+
+    meta.infohash = infohash
+    meta.path = resolved
+    with (
+        patch.object(client, "init_qbittorrent_client", AsyncMock()) as init_client,
+        patch.object(client, "_extract_tracker_ids_from_comment", return_value={"PTP": "123"}) as extract_comment,
+    ):
+        await client.get_ptp_from_hash_qbit(meta, client.config["TORRENT_CLIENTS"]["qbit"], pathed=True)
+
+    init_client.assert_not_awaited()
+    extract_comment.assert_called_once_with("comment from info response")
+    assert meta.get_tracker_id("PTP") == "123"
+    assert meta.source_torrent_client == "qbit"
+
+
+@pytest.mark.asyncio
+async def test_resolve_qbittorrent_hash_checks_other_configured_clients(tmp_path: Path) -> None:
+    media = tmp_path / "downloads" / "Release" / "movie.mkv"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"media")
+    infohash = "b" * 40
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["search"], "default_torrent_client": "search"},
+            "TORRENT_CLIENTS": {
+                "search": {"torrent_client": "qbit"},
+                "actual": {
+                    "torrent_client": "qbit",
+                    "local_path": str(tmp_path / "downloads"),
+                    "remote_path": "/remote/downloads",
+                },
+            },
+        }
+    )
+    search_client = SimpleNamespace(torrents_info=lambda **_kwargs: [])
+    actual_client = SimpleNamespace(
+        torrents_info=lambda **_kwargs: TorrentInfoList([{"hash": infohash, "content_path": "/remote/downloads/Release/movie.mkv", "state": "seeding", "progress": 1.0}])
+    )
+
+    async def init_client(client_config):
+        return search_client if client_config.get("torrent_client") == "qbit" and "local_path" not in client_config else actual_client
+
+    with patch.object(clients, "init_qbittorrent_client", AsyncMock(side_effect=init_client)):
+        resolved = await clients.resolve_qbittorrent_hash_path(Meta(), infohash)
+
+    assert resolved == str(media)
+
+
+@pytest.mark.asyncio
+async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -> None:
+    media = tmp_path / "downloads" / "Release" / "movie.mkv"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"media")
+    infohash = "c" * 40
+    client_config = {
+        "torrent_client": "qbit",
+        "local_path": str(tmp_path / "downloads"),
+        "remote_path": "/remote/downloads",
+    }
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "TORRENT_CLIENTS": {"qbit": client_config},
+        }
+    )
+    qbt_client = SimpleNamespace(
+        torrents_info=lambda **_kwargs: TorrentInfoList(
+            [
+                {
+                    "hash": infohash,
+                    "content_path": "/remote/downloads/Release/movie.mkv",
+                    "name": "Release",
+                    "state": "downloading",
+                    "progress": 0.5,
+                    "comment": "comment from downloading torrent",
+                }
+            ]
+        )
+    )
+    with (
+        patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)) as init_client,
+        patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
+    ):
+        meta = Meta()
+        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+
+    assert resolved == str(media)
+    assert meta.source_torrent_hash == infohash
+    assert meta.torrent_comments == [{"hash": infohash, "name": "Release", "comment": "comment from downloading torrent"}]
+    wait_for_download.assert_awaited_once_with(client_config, infohash)
+
+    meta.infohash = infohash
+    meta.path = resolved
+    with patch.object(clients, "_extract_tracker_ids_from_comment", return_value={"PTP": "456"}) as extract_comment:
+        await clients.get_ptp_from_hash_qbit(meta, client_config, pathed=True)
+
+    extract_comment.assert_called_once_with("comment from downloading torrent")
+    assert meta.get_tracker_id("PTP") == "456"
+    init_client.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preflight_skips_name_search_for_hash_input() -> None:
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "TORRENT_CLIENTS": {"qbit": {"torrent_client": "qbit", "enable_search": True}},
+        }
+    )
+    meta = Meta({"source_torrent_hash": "d" * 40})
+    with patch.object(clients, "init_qbittorrent_client", AsyncMock()) as init_client:
+        await clients.preflight_qbittorrent_search(meta, [])
+
+    init_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -> None:
+    content_path = tmp_path / "Release"
+    client_config = {"torrent_client": "qbit", "enable_search": True}
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "TORRENT_CLIENTS": {"qbit": client_config},
+        }
+    )
+    torrent_hash = "e" * 40
+    matching_torrent = SimpleNamespace(
+        hash=torrent_hash,
+        content_path=str(content_path),
+        name="Release",
+        state="downloading",
+        progress=0.5,
+    )
+    meta = Meta({"path": str(content_path), "uuid": "Release"})
+
+    with (
+        patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=object())),
+        patch.object(clients, "_fetch_qbit_search_results", AsyncMock(return_value=[matching_torrent])) as fetch_results,
+        patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
+    ):
+        await clients.preflight_qbittorrent_search(meta, [])
+
+    fetch_results.assert_awaited_once()
+    wait_for_download.assert_awaited_once_with(client_config, torrent_hash)
+
+
+@pytest.mark.asyncio
+async def test_source_hash_reuse_avoids_qbittorrent_list_search(tmp_path: Path) -> None:
+    media = tmp_path / "Release" / "movie.mkv"
+    media.parent.mkdir()
+    media.write_bytes(b"media")
+    torrent_hash = "f" * 40
+    storage = tmp_path / "torrent_storage"
+    storage.mkdir()
+    torrent = Torrent(path=media)
+    torrent.generate()
+    torrent_path = storage / f"{torrent_hash}.torrent"
+    torrent.write(torrent_path)
+
+    source_client_config = {"torrent_client": "qbit", "torrent_storage_dir": str(storage), "enable_search": True}
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["other"]},
+            "TORRENT_CLIENTS": {
+                "other": {"torrent_client": "qbit", "enable_search": True},
+                "source": source_client_config,
+            },
+        }
+    )
+    meta = Meta(
+        base_dir=str(tmp_path),
+        uuid="Release",
+        path=str(media),
+        filelist=[str(media)],
+        source_torrent_hash=torrent_hash,
+        source_torrent_client="source",
+        client="none",
+    )
+
+    with (
+        patch.object(clients, "is_valid_torrent", AsyncMock(return_value=(True, str(torrent_path)))),
+        patch.object(clients, "search_qbit_for_torrent", AsyncMock()) as list_search,
+    ):
+        reused_paths = await clients.find_existing_torrents(meta)
+
+    assert reused_paths
+    assert meta.reuse_torrent_client == "source"
+    list_search.assert_not_awaited()
 
 
 def test_clients_remote_path_map_parses_stringified_path_lists() -> None:

@@ -163,6 +163,8 @@ class Meta:
     epubmeta_output: str | None = None
     exclusive: bool = False
     ext_torrenthash: str | None = None
+    source_torrent_hash: str | None = None
+    source_torrent_client: str | None = None
     extra_openlibrary_ids: int | None = None
     extras: bool | None = None
     featured: bool = False

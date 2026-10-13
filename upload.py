@@ -2454,6 +2454,19 @@ async def do_the_thing(base_dir: str) -> None:
                     logger.info(f"[yellow]  ⚠ {warning_str}[/yellow]")
                 logger.info("")  # Blank line after warnings
 
+        if meta.path and not Path(meta.path).expanduser().exists() and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", meta.path):
+            from src.clients import Clients
+
+            try:
+                resolved_path = await Clients(config).resolve_qbittorrent_hash_path(meta, meta.path)
+            except ValueError as exc:
+                logger.error(f"[red]{exc}[/red]")
+                raise SystemExit(2) from exc
+            if resolved_path is None:
+                raise SystemExit(2)
+            meta.path = resolved_path
+            paths = [resolved_path]
+
         if meta.cleanup:
             if Path(f"{base_dir}{'/' + 'tmp'}").exists():
                 shutil.rmtree(f"{base_dir}{'/' + 'tmp'}")

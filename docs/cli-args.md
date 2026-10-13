@@ -189,6 +189,8 @@ Thise will use the specified hash to get tracker ids from qBitTorrent or rTorren
 
 - `-th`, `--torrenthash HASH`: Torrent hash containing the torrent id in the comment field of the torrent.
 
+For qBittorrent, a positional 40- or 64-character hexadecimal torrent hash can be used instead of a path. Upload Assistant looks it up in the selected/default search client and uses the torrent's content path; configured `remote_path` to `local_path` mappings are applied before processing.
+
 ## Upload selection / dupe / requests
 
 - `-tk`, `--trackers LIST`: Upload only to these trackers (instead of a default torrent list from config).

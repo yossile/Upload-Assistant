@@ -5,6 +5,7 @@ import ntpath
 import os
 import re
 import sys
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, cast
@@ -669,7 +670,9 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
                     meta.search_year = ""
 
                 if not meta.edit:
+                    mediainfo_started = time.perf_counter()
                     mi = await export_info(videopath, (meta.isdir), meta.uuid, base_dir, is_dvd=(meta.is_disc == "DVD"))
+                    logger.info(f"[cyan]MediaInfo extraction for {Path(videopath).name} completed in {time.perf_counter() - mediainfo_started:.2f}s[/cyan]")
                     meta.mediainfo = mi
                 else:
                     mi = meta.mediainfo

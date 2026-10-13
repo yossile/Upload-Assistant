@@ -5,6 +5,7 @@ import re
 import shutil
 import time
 import urllib.parse
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,7 +18,7 @@ from src.console import logger
 from src.meta import Meta
 from src.stats import record_event_async
 from src.torrent_clients import DelugeClientMixin, QbittorrentClientMixin, RtorrentClientMixin, TransmissionClientMixin
-from src.torrent_clients.path_utils import coerce_str_list, is_path_under
+from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_remote_to_local_path
 from src.torrent_manifest import TorrentManifest
 from src.torrent_policy import HDBITS_POLICY, TorrentStats, generic_reuse_allowed
 from src.torrentcreate import SUBTITLE_EXTENSIONS
@@ -270,7 +271,9 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
         if meta.get("skip_auto_torrent", False):
             return []
         requested = meta.client
-        if isinstance(requested, str) and requested != "none":
+        if meta.source_torrent_hash and meta.source_torrent_client:
+            client_names = [meta.source_torrent_client]
+        elif isinstance(requested, str) and requested != "none":
             client_names = [requested]
         else:
             configured = self.config["DEFAULT"].get("searching_client_list", [])
@@ -441,7 +444,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
         candidates: list[str] = []
 
         # Iterate through pre-specified hashes
-        for hash_key in ["torrenthash", "ext_torrenthash"]:
+        for hash_key in ["source_torrent_hash", "torrenthash", "ext_torrenthash"]:
             hash_value = meta.get(hash_key)
             if hash_value:
                 hash_value_str = str(hash_value)
@@ -456,6 +459,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
                     try:
                         proxy_url = client.get("qui_proxy_url")
+                        export_started = time.perf_counter()
                         if proxy_url:
                             qbt_proxy_url = proxy_url.rstrip("/")
                             async with httpx.AsyncClient() as session:
@@ -486,6 +490,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                                 )
                             except TimeoutError, qbittorrentapi.APIError:
                                 continue
+                        logger.info(f"[cyan]Client torrent export for hash {hash_value_str} completed in {time.perf_counter() - export_started:.2f}s[/cyan]")
                         if not torrent_file_content:
                             logger.info(f"[bold red]qBittorrent returned an empty response for hash {hash_value_str}")
                             continue  # Skip to the next hash
@@ -506,10 +511,15 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                 valid, resolved_path = await self.is_valid_torrent(meta, torrent_path, hash_value_str, torrent_client, client)
 
                 if valid:
+                    logger.info(f"[green]Using validated torrent file for hash {hash_value_str}: {resolved_path}[/green]")
                     if not collect_all:
                         return resolved_path
                     if resolved_path not in candidates:
                         candidates.append(resolved_path)
+                    if hash_key == "source_torrent_hash":
+                        return candidates
+                else:
+                    logger.info(f"[bold red]Torrent file for hash {hash_value_str} failed validation: {torrent_path}")
 
         # Search the client if no pre-specified hash matches
         if torrent_client == "qbit" and client.get("enable_search"):
@@ -837,6 +847,112 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
             remote_path = remote_path + os.sep
 
         return local_path, remote_path
+
+    async def resolve_qbittorrent_hash_path(self, meta: Meta, infohash: str) -> str | None:
+        """Resolve a qBittorrent hash to its locally accessible content path."""
+        default_config = cast(dict[str, Any], self.config.get("DEFAULT", {}))
+        clients_config = cast(dict[str, Any], self.config.get("TORRENT_CLIENTS", {}))
+        requested_client = meta.client
+        if isinstance(requested_client, str) and requested_client and requested_client != "none":
+            client_names = [requested_client]
+        else:
+            client_names = coerce_str_list(default_config.get("searching_client_list", []))
+            default_client = default_config.get("default_torrent_client")
+            if isinstance(default_client, str) and default_client and default_client != "none" and default_client not in client_names:
+                client_names.append(default_client)
+            for configured_name, configured_client in cast(dict[str, Any], clients_config).items():
+                client_name = str(configured_name)
+                configured_client = cast(dict[str, Any], configured_client) if isinstance(configured_client, dict) else None
+                if (
+                    client_name not in client_names
+                    and configured_client is not None
+                    and str(configured_client.get("torrent_client", "")).lower() == "qbit"
+                ):
+                    client_names.append(client_name)
+
+        for client_name in client_names:
+            client_value = clients_config.get(client_name)
+            if not isinstance(client_value, dict):
+                continue
+            client_value = cast(dict[str, Any], client_value)
+            if str(client_value.get("torrent_client", "")).lower() != "qbit":
+                continue
+
+            proxy_url = client_value.get("qui_proxy_url")
+            if proxy_url:
+                try:
+                    ssl_context = self.create_ssl_context_for_client(client_value)
+                    async with httpx.AsyncClient(timeout=10.0, verify=ssl_context) as session:
+                        response = await session.get(
+                            f"{str(proxy_url).rstrip('/')}/api/v2/torrents/info",
+                            params={"hashes": infohash},
+                        )
+                        if response.status_code != 200:
+                            logger.info(f"[bold red]qBittorrent hash lookup failed via proxy: HTTP {response.status_code}")
+                            continue
+                        torrents = response.json()
+                except Exception as exc:
+                    logger.info(f"[bold red]qBittorrent hash lookup failed via proxy for client '{client_name}': {exc}")
+                    continue
+            else:
+                qbt_client = await self.init_qbittorrent_client(client_value)
+                if qbt_client is None:
+                    continue
+                try:
+                    torrents = await self.retry_qbt_operation(
+                        lambda qbt_client=qbt_client: asyncio.to_thread(qbt_client.torrents_info, torrent_hashes=infohash),
+                        f"Get qBittorrent torrent {infohash}",
+                    )
+                except Exception as exc:
+                    logger.info(f"[bold red]qBittorrent hash lookup failed for client '{client_name}': {exc}")
+                    continue
+
+            if not isinstance(torrents, Sequence):
+                continue
+            for torrent in cast(Sequence[Any], torrents):
+                torrent_data = cast(dict[str, Any], torrent) if isinstance(torrent, dict) else None
+                torrent_hash = torrent_data.get("hash", "") if torrent_data is not None else getattr(torrent, "hash", "")
+                if str(torrent_hash).lower() != infohash.lower():
+                    continue
+
+                content_path = torrent_data.get("content_path", "") if torrent_data is not None else getattr(torrent, "content_path", "")
+                if not content_path:
+                    save_path = torrent_data.get("save_path", "") if torrent_data is not None else getattr(torrent, "save_path", "")
+                    torrent_name = torrent_data.get("name", "") if torrent_data is not None else getattr(torrent, "name", "")
+                    content_path = str(Path(str(save_path)) / str(torrent_name))
+                if not content_path:
+                    continue
+
+                comment = torrent_data.get("comment") if torrent_data is not None else getattr(torrent, "comment", None)
+                if isinstance(comment, str):
+                    torrent_comments = meta.torrent_comments
+                    if not isinstance(torrent_comments, list):
+                        torrent_comments = []
+                        meta.torrent_comments = torrent_comments
+                    has_cached_comment = False
+                    for item in cast(list[Any], torrent_comments):
+                        if isinstance(item, dict) and str(cast(dict[str, Any], item).get("hash", "")).lower() == infohash.lower():
+                            has_cached_comment = True
+                            break
+                    if not has_cached_comment:
+                        torrent_name = torrent_data.get("name", "") if torrent_data is not None else getattr(torrent, "name", "")
+                        torrent_comments.append({"hash": infohash, "name": str(torrent_name or ""), "comment": comment})
+
+                local_paths = coerce_str_list(client_value.get("local_path", ["/LocalPath"])) or ["/LocalPath"]
+                remote_paths = coerce_str_list(client_value.get("remote_path", ["/RemotePath"])) or ["/RemotePath"]
+                local_path = map_remote_to_local_path(str(content_path), local_paths, remote_paths)
+                resolved_path = str(Path(local_path).expanduser().resolve())
+                if not self._qbit_torrent_is_complete(torrent):
+                    await self._wait_for_qbittorrent_download(client_value, infohash)
+                if not Path(resolved_path).exists():
+                    raise ValueError(f"Resolved local content path does not exist: {resolved_path}")
+                meta.source_torrent_hash = infohash
+                meta.source_torrent_client = client_name
+                logger.info(f"[green]Resolved torrent hash {infohash} to {resolved_path} using client '{client_name}'")
+                return resolved_path
+
+        logger.info(f"[bold red]Torrent hash {infohash} was not found in the configured qBittorrent clients: {', '.join(client_names) or 'none'}")
+        return None
 
     async def get_ptp_from_hash(self, meta: Meta, pathed: bool = False, client_name: str | None = None) -> Meta:
         """Fetch PTP metadata through the configured torrent client when available."""
