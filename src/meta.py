@@ -439,6 +439,17 @@ class Meta:
     tracker_ids: dict[str, str] = field(default_factory=dict)
     tracker_description_mode: str = ""
     tracker_search_term: str = ""
+    tracker_search_attempted: bool = False
+    tracker_prefetch_completed: bool = False
+    tracker_prefetch_search_term: str = ""
+    tracker_prefetch_category: str = ""
+    tracker_prefetch_ids: dict[str, str] = field(default_factory=dict)
+    imdb_tmdb_prefetch_completed: bool = False
+    imdb_tmdb_prefetch_title: str = ""
+    imdb_tmdb_prefetch_year: str = ""
+    imdb_tmdb_prefetch_category: str = ""
+    imdb_tmdb_prefetch_secondary_title: str = ""
+    imdb_tmdb_prefetch_untouched_filename: str = ""
     persist_description: bool = True
     scene_name: str = ""
     scene_nfo_file: str = ""

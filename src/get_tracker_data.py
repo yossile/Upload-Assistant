@@ -304,7 +304,10 @@ class TrackerDataManager:
         search_file_folder: str | None = None,
         cat: str | None = None,
         skip_tracker_descriptions: bool = False,
+        *,
+        id_only_prefetch: bool = False,
     ) -> Meta:
+        meta.tracker_search_attempted = False
         found_match = False
         base_dir = meta.base_dir
         search_term_value = search_term or ""
@@ -328,6 +331,8 @@ class TrackerDataManager:
             logger.debug(f"[blue]Specific trackers to check: {specific_tracker}[/blue]")
 
             if specific_tracker:
+                if id_only_prefetch:
+                    specific_tracker = [tracker for tracker in specific_tracker if tracker != "ANTHELION"]
                 if meta.is_disc and "ANTHELION" in specific_tracker:
                     specific_tracker.remove("ANTHELION")
                 if meta.category == "MOVIE" and "BROADCASTHENET" in specific_tracker:
@@ -382,6 +387,8 @@ class TrackerDataManager:
                             skip_tracker_descriptions,
                         )
 
+                if available_trackers:
+                    meta.tracker_search_attempted = True
                 results = await asyncio.gather(*(collect(tracker_name) for tracker_name in available_trackers))
                 candidates = [result for result in results if result is not None]
                 for tracker_name in available_trackers:
@@ -410,6 +417,8 @@ class TrackerDataManager:
 
                 other_api = sorted(api_trackers - {"BEYONDHD"})
                 tracker_order = ["PASSTHEPOPCORN", "HDBITS", "BEYONDHD", *other_api]
+                if id_only_prefetch:
+                    tracker_order = [tracker for tracker in tracker_order if tracker != "ANTHELION"]
 
                 if cat == "TV" or meta.category == "TV":
                     logger.debug("[yellow]Detected TV content, skipping PASSTHEPOPCORN tracker check")
@@ -445,6 +454,7 @@ class TrackerDataManager:
 
                 for tracker_name in tracker_order:
                     if not found_match and self._search_enabled(tracker_name):  # Stop checking once a match is found
+                        meta.tracker_search_attempted = True
                         meta = await process_tracker(tracker_name, meta, skip_tracker_descriptions)
 
                 if not found_match:

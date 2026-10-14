@@ -13,7 +13,9 @@ from qbittorrentapi.torrents import TorrentInfoList
 from torf import Torrent
 
 from src.clients import Clients
+from src.get_tracker_data import TrackerDataManager
 from src.meta import Meta
+from src.prep_helpers import _imdb_tmdb_prefetch_matches, _tracker_prefetch_matches
 from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_remote_to_local_path, map_save_path, tracker_directory
 from src.torrent_clients.qbittorrent import _link_torrent_files, create_cross_seed_links
 
@@ -240,10 +242,14 @@ async def test_resolve_qbittorrent_hash_path_maps_content_path(tmp_path: Path) -
         )
 
     qbt_client = SimpleNamespace(torrents_info=torrents_info)
-    with patch.object(client, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)):
+    with (
+        patch.object(client, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)),
+        patch.object(client, "_start_hash_metadata_prefetch") as start_prefetch,
+    ):
         meta = Meta(base_dir=str(tmp_path), uuid="Release")
         resolved = await client.resolve_qbittorrent_hash_path(meta, infohash)
 
+    start_prefetch.assert_not_called()
     assert resolved == str(media)
     assert meta.source_torrent_hash == infohash
     assert meta.torrent_comments == [{"hash": infohash, "name": "Release", "comment": "comment from info response"}]
@@ -349,6 +355,207 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_hash_wait_prefetches_tracker_ids_and_carries_them_forward(tmp_path: Path) -> None:
+    media = tmp_path / "downloads" / "Release.mkv"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"media")
+    infohash = "1" * 40
+    client_config = {
+        "torrent_client": "qbit",
+        "local_path": str(tmp_path / "downloads"),
+        "remote_path": "/remote/downloads",
+    }
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "TORRENT_CLIENTS": {"qbit": client_config},
+        }
+    )
+    qbt_client = SimpleNamespace(
+        torrents_info=lambda **_kwargs: TorrentInfoList(
+            [
+                {
+                    "hash": infohash,
+                    "content_path": "/remote/downloads/Release.mkv",
+                    "name": "Release.mkv",
+                    "state": "downloading",
+                    "progress": 0.5,
+                    "comment": "https://lst.gg/torrents/262607",
+                }
+            ]
+        )
+    )
+    tracker_started = asyncio.Event()
+    finish_tracker = asyncio.Event()
+    tracker_finished = asyncio.Event()
+
+    async def lookup_tracker(_video, prefetched_meta, search_term, search_file_folder, category, **kwargs):
+        assert search_term == "Release.mkv"
+        assert search_file_folder == "file"
+        assert category == "MOVIE"
+        assert prefetched_meta.get_tracker_id("LST") == "262607"
+        assert kwargs["skip_tracker_descriptions"] is True
+        tracker_started.set()
+        await finish_tracker.wait()
+        prefetched_meta.imdb_id = 12345
+        prefetched_meta.matched_tracker = "PASSTHEPOPCORN"
+        prefetched_meta.tracker_search_attempted = True
+        tracker_finished.set()
+
+    async def wait_for_download(*_args):
+        await asyncio.wait_for(tracker_started.wait(), timeout=2)
+        assert not tracker_finished.is_set()
+        finish_tracker.set()
+
+    with (
+        patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)),
+        patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock(side_effect=wait_for_download)),
+        patch.object(clients, "_extract_tracker_ids_from_comment", return_value={"LST": "262607"}),
+        patch("src.get_tracker_data.TrackerDataManager.get_tracker_data", new=AsyncMock(side_effect=lookup_tracker)),
+    ):
+        meta = Meta(
+            {
+                "base_dir": str(tmp_path),
+                "uuid": "Release.mkv",
+                "unattended": True,
+                "only_id": True,
+                "category": "MOVIE",
+            }
+        )
+        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+
+    assert resolved == str(media)
+    assert meta.imdb_id == 12345
+    assert meta.matched_tracker == "PASSTHEPOPCORN"
+    assert meta.tracker_prefetch_completed is True
+    assert meta.tracker_prefetch_search_term == "Release.mkv"
+    assert meta.tracker_prefetch_category == "MOVIE"
+    assert meta.get_tracker_id("LST") == "262607"
+    assert meta.tracker_prefetch_ids == {"LST": "262607"}
+
+
+@pytest.mark.asyncio
+async def test_hash_wait_prefetches_imdb_tmdb_without_trackers(tmp_path: Path) -> None:
+    media = tmp_path / "downloads" / "Some.Movie.2024.mkv"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"media")
+    infohash = "2" * 40
+    client_config = {
+        "torrent_client": "qbit",
+        "local_path": str(tmp_path / "downloads"),
+        "remote_path": "/remote/downloads",
+    }
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": ["qbit"], "tracker_description_mode": "ids", "tmdb_api": "test-api-key"},
+            "TORRENT_CLIENTS": {"qbit": client_config},
+        }
+    )
+    qbt_client = SimpleNamespace(
+        torrents_info=lambda **_kwargs: TorrentInfoList(
+            [
+                {
+                    "hash": infohash,
+                    "content_path": "/remote/downloads/Some.Movie.2024.mkv",
+                    "name": "Some.Movie.2024.mkv",
+                    "state": "downloading",
+                    "progress": 0.5,
+                }
+            ]
+        )
+    )
+    tmdb_started = asyncio.Event()
+    imdb_started = asyncio.Event()
+    finish_lookups = asyncio.Event()
+
+    async def get_tmdb_id(*_args, **_kwargs):
+        tmdb_started.set()
+        await finish_lookups.wait()
+        return 272726, "MOVIE"
+
+    async def search_imdb(*_args, **_kwargs):
+        imdb_started.set()
+        await finish_lookups.wait()
+        return 3109200
+
+    async def wait_for_download(*_args):
+        await asyncio.wait_for(asyncio.gather(tmdb_started.wait(), imdb_started.wait()), timeout=2)
+        finish_lookups.set()
+
+    with (
+        patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)),
+        patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock(side_effect=wait_for_download)),
+        patch("src.get_name.NameManager.extract_title_and_year", new=AsyncMock(return_value=("Some Movie", None, "2024"))),
+        patch("src.tmdb.TmdbManager.get_tmdb_id", new=AsyncMock(side_effect=get_tmdb_id)) as tmdb_search,
+        patch("src.imdb.imdb_manager.search_imdb", new=AsyncMock(side_effect=search_imdb)) as imdb_search,
+    ):
+        meta = Meta(
+            {
+                "base_dir": str(tmp_path),
+                "uuid": "Some.Movie.2024.mkv",
+                "unattended": True,
+                "only_id": True,
+                "category": "MOVIE",
+            }
+        )
+        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+
+    assert resolved == str(media)
+    assert meta.tmdb_id == 272726
+    assert meta.imdb_id == 3109200
+    assert meta.imdb_tmdb_prefetch_completed is True
+    assert tmdb_search.await_count == 1
+    assert imdb_search.await_count == 1
+
+
+def test_tracker_prefetch_reuse_requires_matching_search_inputs() -> None:
+    meta = Meta(
+        {
+            "category": "MOVIE",
+            "tracker_prefetch_completed": True,
+            "tracker_prefetch_search_term": "Release.mkv",
+            "tracker_prefetch_category": "MOVIE",
+        }
+    )
+
+    assert _tracker_prefetch_matches(meta, "Release.mkv")
+    assert not _tracker_prefetch_matches(meta, "Other.Release.mkv")
+    meta.tracker_prefetch_ids = {"LST": "262607"}
+    meta.set_tracker_ids({"LST": "262607"})
+    assert _tracker_prefetch_matches(meta, "Other.Release.mkv")
+    meta.set_tracker_ids({"LST": "999999"})
+    assert not _tracker_prefetch_matches(meta, "Other.Release.mkv")
+    meta.category = "TV"
+    assert not _tracker_prefetch_matches(meta, "Release.mkv")
+
+
+def test_imdb_tmdb_prefetch_reuse_requires_matching_search_inputs() -> None:
+    meta = Meta(
+        {
+            "imdb_tmdb_prefetch_completed": True,
+            "imdb_tmdb_prefetch_title": "Some Movie",
+            "imdb_tmdb_prefetch_year": "2024",
+            "imdb_tmdb_prefetch_category": "MOVIE",
+            "imdb_tmdb_prefetch_secondary_title": "",
+            "imdb_tmdb_prefetch_untouched_filename": "Some.Movie.2024.mkv",
+        }
+    )
+
+    assert _imdb_tmdb_prefetch_matches(meta, "Some Movie", "2024", "MOVIE", None, "Some.Movie.2024.mkv")
+    assert not _imdb_tmdb_prefetch_matches(meta, "Other Movie", "2024", "MOVIE", None, "Some.Movie.2024.mkv")
+
+
+@pytest.mark.asyncio
+async def test_id_only_prefetch_does_not_claim_skipped_tracker_search_completed() -> None:
+    manager = TrackerDataManager({"DEFAULT": {"tracker_comment_only": True}})
+    meta = Meta()
+
+    await manager.get_tracker_data(None, meta, "Release.mkv", "file", "MOVIE", skip_tracker_descriptions=True, id_only_prefetch=True)
+
+    assert meta.tracker_search_attempted is False
+
+
+@pytest.mark.asyncio
 async def test_preflight_skips_name_search_for_hash_input() -> None:
     clients = Clients(
         {
@@ -387,11 +594,13 @@ async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -
         patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=object())),
         patch.object(clients, "_fetch_qbit_search_results", AsyncMock(return_value=[matching_torrent])) as fetch_results,
         patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
+        patch.object(clients, "_start_hash_metadata_prefetch") as start_prefetch,
     ):
         await clients.preflight_qbittorrent_search(meta, [])
 
     fetch_results.assert_awaited_once()
     wait_for_download.assert_awaited_once_with(client_config, torrent_hash)
+    start_prefetch.assert_not_called()
 
 
 @pytest.mark.asyncio

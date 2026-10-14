@@ -924,7 +924,9 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                     continue
 
                 comment = torrent_data.get("comment") if torrent_data is not None else getattr(torrent, "comment", None)
+                comment_tracker_ids: dict[str, str] = {}
                 if isinstance(comment, str):
+                    comment_tracker_ids = self._extract_tracker_ids_from_comment(comment)
                     torrent_comments = meta.torrent_comments
                     if not isinstance(torrent_comments, list):
                         torrent_comments = []
@@ -942,8 +944,31 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                 remote_paths = coerce_str_list(client_value.get("remote_path", ["/RemotePath"])) or ["/RemotePath"]
                 local_path = map_remote_to_local_path(str(content_path), local_paths, remote_paths)
                 resolved_path = str(Path(local_path).expanduser().resolve())
+                prefetch_task: asyncio.Task[Meta] | None = None
                 if not self._qbit_torrent_is_complete(torrent):
-                    await self._wait_for_qbittorrent_download(client_value, infohash)
+                    torrent_name_value = torrent_data.get("name") if torrent_data is not None else getattr(torrent, "name", None)
+                    if isinstance(torrent_name_value, str) and torrent_name_value:
+                        prefetch_task = self._start_hash_metadata_prefetch(meta, torrent_name_value, str(content_path), comment_tracker_ids)
+                    try:
+                        await self._wait_for_qbittorrent_download(client_value, infohash)
+                        if prefetch_task is not None:
+                            try:
+                                prefetched_meta = await prefetch_task
+                            except Exception as error:
+                                logger.debug(f"[yellow]Early metadata lookup failed: {error}[/yellow]")
+                            else:
+                                if prefetched_meta.tracker_search_attempted or prefetched_meta.imdb_tmdb_prefetch_completed:
+                                    meta.update(prefetched_meta)
+                                if prefetched_meta.tracker_search_attempted:
+                                    meta.tracker_prefetch_completed = True
+                                    meta.tracker_prefetch_search_term = torrent_name_value
+                                    meta.tracker_prefetch_category = prefetched_meta.tracker_prefetch_category
+                                    meta.tracker_prefetch_ids = dict(comment_tracker_ids)
+                    except BaseException:
+                        if prefetch_task is not None and not prefetch_task.done():
+                            prefetch_task.cancel()
+                            await asyncio.gather(prefetch_task, return_exceptions=True)
+                        raise
                 if not Path(resolved_path).exists():
                     raise ValueError(f"Resolved local content path does not exist: {resolved_path}")
                 meta.source_torrent_hash = infohash
@@ -953,6 +978,148 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
         logger.info(f"[bold red]Torrent hash {infohash} was not found in the configured qBittorrent clients: {', '.join(client_names) or 'none'}")
         return None
+
+    def _start_hash_metadata_prefetch(
+        self,
+        meta: Meta,
+        torrent_name: str,
+        content_path: str,
+        comment_tracker_ids: dict[str, str] | None = None,
+    ) -> asyncio.Task[Meta] | None:
+        """Start ID-only tracker and IMDb/TMDb searches during an unattended hash download."""
+        default_config = cast(dict[str, Any], self.config.get("DEFAULT", {}))
+        description_mode = str(default_config.get("tracker_description_mode", "text")).strip().lower()
+        if not meta.unattended:
+            return None
+
+        category = str(meta.manual_category or meta.category or "").strip().upper()
+        if not category or category == "SPORTS":
+            category_source = f"{torrent_name} {meta.uuid}"
+            category = "TV" if re.search(r"(?i)(?:s\d{1,2}e\d{1,2}|\b\d{1,2}x\d{2}\b|season\s*\d+|series\s*\d+)", category_source) else "MOVIE"
+        if category not in {"MOVIE", "TV", "XXX"}:
+            return None
+
+        search_file_folder = "file" if Path(content_path).suffix else "folder"
+        prefetched_meta = meta.copy()
+        prefetched_meta.category = category
+        prefetched_meta.unattended = True
+        prefetched_meta.tracker_description_mode = "ids"
+        prefetched_meta.keep_images = False
+        prefetched_meta.skip_tracker_descriptions = True
+        prefetched_meta.tracker_prefetch_category = category
+        if comment_tracker_ids:
+            prefetched_meta.set_tracker_ids({**comment_tracker_ids, **prefetched_meta.tracker_ids})
+
+        async def lookup() -> Meta:
+            if meta.only_id or description_mode == "ids":
+                from src.get_tracker_data import TrackerDataManager
+
+                try:
+                    await TrackerDataManager(self.config).get_tracker_data(
+                        None,
+                        prefetched_meta,
+                        torrent_name,
+                        search_file_folder,
+                        category,
+                        skip_tracker_descriptions=True,
+                        id_only_prefetch=True,
+                    )
+                except Exception as error:
+                    logger.debug(f"[yellow]Early tracker metadata lookup failed: {error}[/yellow]")
+
+            if category not in {"MOVIE", "TV"} or prefetched_meta.tmdb_id or prefetched_meta.imdb_id or (meta.no_tmdb and meta.no_imdb):
+                return prefetched_meta
+
+            from src.get_name import NameManager
+            from src.imdb import imdb_manager
+            from src.tmdb import TmdbManager
+
+            parsing_meta = prefetched_meta.copy()
+            parsing_meta.uuid = torrent_name
+            title, secondary_title, extracted_year = await NameManager(self.config).extract_title_and_year(parsing_meta, torrent_name)
+            if not title:
+                return prefetched_meta
+
+            year = meta.manual_year or (meta.search_year or extracted_year or meta.year if category == "TV" else extracted_year or meta.year or meta.search_year)
+            year_match = re.search(r"\b(?:18|19|20)\d{2}\b", str(year or ""))
+            search_year = year_match.group(0) if year_match else None
+            async def search_tmdb() -> tuple[bool, tuple[int, str] | None]:
+                try:
+                    tmdb_manager = TmdbManager(self.config)
+                    result = await tmdb_manager.get_tmdb_id(
+                        title,
+                        search_year,
+                        category,
+                        torrent_name,
+                        debug=bool(meta.debug),
+                        secondary_title=secondary_title,
+                        unattended=True,
+                    )
+                    return True, result
+                except Exception as error:
+                    logger.debug(f"[yellow]Early TMDb lookup failed: {error}[/yellow]")
+                    return False, None
+
+            async def search_imdb() -> tuple[bool, int | None]:
+                try:
+                    result = await imdb_manager.search_imdb(
+                        title,
+                        search_year,
+                        quickie=True,
+                        category=category,
+                        secondary_title=secondary_title,
+                        untouched_filename=torrent_name,
+                        unattended=True,
+                    )
+                    return True, result
+                except Exception as error:
+                    logger.debug(f"[yellow]Early IMDb lookup failed: {error}[/yellow]")
+                    return False, None
+
+            tmdb_task: asyncio.Task[tuple[bool, tuple[int, str] | None]] | None = None
+            imdb_task: asyncio.Task[tuple[bool, int | None]] | None = None
+            if not meta.no_tmdb:
+                tmdb_task = asyncio.create_task(search_tmdb())
+            if not meta.no_imdb:
+                imdb_task = asyncio.create_task(search_imdb())
+
+            tmdb_result: tuple[int, str] | None = None
+            imdb_result = 0
+            query_succeeded = False
+            if tmdb_task is not None and imdb_task is not None:
+                (tmdb_succeeded, tmdb_result), (imdb_succeeded, imdb_result_value) = await asyncio.gather(tmdb_task, imdb_task)
+                query_succeeded = tmdb_succeeded or imdb_succeeded
+                imdb_result = imdb_result_value or 0
+            elif tmdb_task is not None:
+                tmdb_succeeded, tmdb_result = await tmdb_task
+                query_succeeded = tmdb_succeeded
+            elif imdb_task is not None:
+                imdb_succeeded, imdb_result_value = await imdb_task
+                query_succeeded = imdb_succeeded
+                imdb_result = imdb_result_value or 0
+
+            if tmdb_result is not None:
+                tmdb_id, result_category = tmdb_result
+                if result_category != category:
+                    return prefetched_meta
+                if not prefetched_meta.tmdb_id:
+                    prefetched_meta.tmdb_id = tmdb_id
+            if imdb_result and not prefetched_meta.imdb_id:
+                prefetched_meta.imdb_id = imdb_result
+
+            if not query_succeeded:
+                return prefetched_meta
+            prefetched_meta.quickie_search = True
+            prefetched_meta.no_ids = True
+            prefetched_meta.imdb_tmdb_prefetch_completed = True
+            prefetched_meta.imdb_tmdb_prefetch_title = title
+            prefetched_meta.imdb_tmdb_prefetch_year = search_year or ""
+            prefetched_meta.imdb_tmdb_prefetch_category = category
+            prefetched_meta.imdb_tmdb_prefetch_secondary_title = secondary_title or ""
+            prefetched_meta.imdb_tmdb_prefetch_untouched_filename = torrent_name
+            return prefetched_meta
+
+        return asyncio.create_task(lookup())
 
     async def get_ptp_from_hash(self, meta: Meta, pathed: bool = False, client_name: str | None = None) -> Meta:
         """Fetch PTP metadata through the configured torrent client when available."""

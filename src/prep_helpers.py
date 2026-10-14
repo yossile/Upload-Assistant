@@ -940,6 +940,32 @@ def _should_lookup_torrent_properties(meta: Meta, ids: dict[str, Any] | None) ->
     return bool(meta.infohash is not None and not meta.base_torrent_created and not meta.we_checked_them_all and not meta.reuse_torrent_path and not ids)
 
 
+def _tracker_prefetch_matches(meta: Meta, search_term: str) -> bool:
+    if not meta.tracker_prefetch_completed or meta.tracker_prefetch_category != meta.category:
+        return False
+    if meta.tracker_prefetch_search_term == search_term:
+        return True
+    return bool(meta.tracker_prefetch_ids) and all(meta.get_tracker_id(tracker) == torrent_id for tracker, torrent_id in meta.tracker_prefetch_ids.items())
+
+
+def _imdb_tmdb_prefetch_matches(
+    meta: Meta,
+    filename: str,
+    search_year: str | None,
+    category: str,
+    secondary_title: str | None,
+    untouched_filename: str,
+) -> bool:
+    return (
+        meta.imdb_tmdb_prefetch_completed
+        and meta.imdb_tmdb_prefetch_title == filename
+        and meta.imdb_tmdb_prefetch_year == (search_year or "")
+        and meta.imdb_tmdb_prefetch_category == category
+        and meta.imdb_tmdb_prefetch_secondary_title == (secondary_title or "")
+        and meta.imdb_tmdb_prefetch_untouched_filename == untouched_filename
+    )
+
+
 async def search_metadata(
     prep_instance: Any,
     meta: Meta,
@@ -1078,7 +1104,8 @@ async def search_metadata(
         if _should_lookup_torrent_properties(meta, ids):
             meta = await client.get_ptp_from_hash(meta)
 
-        if not meta.edit and (not ids or meta.tracker_ids):
+        tracker_prefetch_matches = _tracker_prefetch_matches(meta, search_term)
+        if not meta.edit and (not ids or meta.tracker_ids) and not tracker_prefetch_matches:
             # Reuse information from trackers with fallback
             await prep_instance.tracker_data_manager.get_tracker_data(
                 videopath, meta, search_term, search_file_folder, meta.category, skip_tracker_descriptions=skip_tracker_descriptions
@@ -1192,7 +1219,11 @@ async def search_metadata(
         year = meta.manual_year or meta.search_year or meta.year if meta.category == "TV" else meta.manual_year or meta.year or meta.search_year
         year_value = _normalize_search_year(year)
         category_pref = meta.category or ""
-        if meta.no_tmdb:
+        id_prefetch_matches = _imdb_tmdb_prefetch_matches(meta, filename, year_value, category_pref, meta.secondary_title, untouched_filename)
+        if id_prefetch_matches:
+            meta.quickie_search = True
+            meta.no_ids = True
+        elif meta.no_tmdb:
             tmdb_id, category = 0, category_pref
             imdb_result = 0 if meta.no_imdb else await imdb_manager.search_imdb(
                 filename,
