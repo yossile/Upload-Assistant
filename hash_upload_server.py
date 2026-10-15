@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import Sequence
 
@@ -16,21 +17,37 @@ UPLOAD_SCRIPT = PROJECT_ROOT / "upload.py"
 TORRENT_HASH_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 ALLOW_CONCURRENT_UPLOADS = True
 _upload_lock = threading.Lock()
-_active_upload_process: subprocess.Popen[bytes] | None = None
+_active_upload_processes: dict[str, subprocess.Popen[bytes]] = {}
 
 app = Flask(__name__)
 
 
-def _start_upload_process(command: list[str]) -> subprocess.Popen[bytes] | None:
-    global _active_upload_process
-    if ALLOW_CONCURRENT_UPLOADS:
-        return subprocess.Popen(command, cwd=PROJECT_ROOT)
-
+def _toggle_upload_process(
+    command: list[str], torrent_hash: str
+) -> tuple[subprocess.Popen[bytes] | None, str]:
+    upload_key = torrent_hash.lower()
     with _upload_lock:
-        if _active_upload_process is not None and _active_upload_process.poll() is None:
-            return None
-        _active_upload_process = subprocess.Popen(command, cwd=PROJECT_ROOT)
-        return _active_upload_process
+        for key, process in list(_active_upload_processes.items()):
+            if process.poll() is not None:
+                del _active_upload_processes[key]
+
+        process = _active_upload_processes.get(upload_key)
+        if process is not None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            del _active_upload_processes[upload_key]
+            return process, "cancelled"
+
+        if not ALLOW_CONCURRENT_UPLOADS and _active_upload_processes:
+            return None, "busy"
+        process = subprocess.Popen(command, cwd=PROJECT_ROOT)
+        _active_upload_processes[upload_key] = process
+        return process, "started"
 
 
 @app.get("/upload")
@@ -48,14 +65,14 @@ def upload_hash():
         command = [sys.executable, str(UPLOAD_SCRIPT), torrent_hash, "--unattended"]
         if debug:
             command.append("--debug")
-        process = _start_upload_process(command)
+        process, status = _toggle_upload_process(command, torrent_hash)
     except OSError:
-        app.logger.exception("Could not start Upload Assistant")
-        return jsonify(success=False, error="Could not start Upload Assistant"), 500
+        app.logger.exception("Could not start or cancel Upload Assistant")
+        return jsonify(success=False, error="Could not start or cancel Upload Assistant"), 500
     if process is None:
         return jsonify(success=False, error="An upload is already running"), 409
 
-    return jsonify(success=True, status="started", hash=torrent_hash, pid=process.pid), 202
+    return jsonify(success=True, status=status, hash=torrent_hash, pid=process.pid), 200 if status == "cancelled" else 202
 
 
 def main(argv: Sequence[str] | None = None) -> int:
