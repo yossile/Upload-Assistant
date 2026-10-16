@@ -183,6 +183,7 @@ async def _run(args: argparse.Namespace) -> int:
         logger.info(tracker_status.get("status_message", "PTP upload completed"))
         return 0
     finally:
+        await PassThePopcorn.cancel_prefetch(meta)
         await cancel_and_drain_early_artifact_tasks(str(meta.uuid or args.path.name))
 
 

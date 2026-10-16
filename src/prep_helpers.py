@@ -981,6 +981,7 @@ async def search_metadata(
     _bdinfo: dict[str, Any],
     mi: dict[str, Any] | None,
 ) -> None:
+    await client.finish_hash_metadata_prefetch(meta)
     # Ensure all manual IDs have proper default values
     meta.tmdb_manual = meta.tmdb_manual or 0
     meta.imdb_manual = meta.imdb_manual or 0

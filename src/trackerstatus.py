@@ -248,10 +248,7 @@ class TrackerStatusManager:
                             search_started = time.monotonic()
                             try:
                                 group_lookup_started_at = time.perf_counter()
-                                if local_meta.get("imdb_id", 0):
-                                    group_id = await ptp.get_group_by_imdb(local_meta["imdb"])
-                                else:
-                                    group_id = await ptp.get_group_by_tmdb(local_meta["tmdb_id"])
+                                group_id = await ptp.get_group_for_meta(local_meta)
                                 log_ptp_timing(local_meta, "group lookup", group_lookup_started_at)
                                 async with meta_lock:
                                     meta.ptp_groupid = group_id
@@ -351,7 +348,10 @@ class TrackerStatusManager:
         if searching_trackers:
             logger.info("[yellow]Searching for existing torrents on selected trackers...")
         tasks = [process_single_tracker(tracker_name, meta) for tracker_name in meta.trackers]
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+        finally:
+            await PassThePopcorn.cancel_group_prefetch(meta)
 
         # Collect passed trackers and skip reasons
         passed_trackers: list[tuple[str, str | None, Any]] = []
@@ -373,6 +373,8 @@ class TrackerStatusManager:
             logger.info(f"[red]Skipped due to specific tracker conditions: [bold yellow]{', '.join(skipped_trackers)}[/bold yellow].")
         if dupe_trackers:
             logger.info(f"[red]Found potential dupes on: [bold yellow]{', '.join(dupe_trackers)}[/bold yellow].\n")
+        if not any(tracker_name == "PASSTHEPOPCORN" for tracker_name, _display_name, _tracker_class in passed_trackers):
+            await PassThePopcorn.cancel_title_prefetch(meta)
 
         # Now handle the confirmation/upload decisions
         if meta.unattended:

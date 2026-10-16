@@ -7,7 +7,7 @@ import time
 import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import defusedxml.xmlrpc
 import httpx
@@ -29,6 +29,7 @@ defusedxml.xmlrpc.monkey_patch()
 
 class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, TransmissionClientMixin):
     _qbit_search_results_cache: dict[tuple[int, str], list[Any]]
+    _hash_metadata_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[asyncio.Task[Meta], Meta, str, dict[str, str]]]] = {}
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialize torrent-client operations with the application config."""
@@ -946,30 +947,25 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                 resolved_path = str(Path(local_path).expanduser().resolve())
                 prefetch_task: asyncio.Task[Meta] | None = None
                 if not self._qbit_torrent_is_complete(torrent):
+                    meta.source_torrent_hash = infohash
                     torrent_name_value = torrent_data.get("name") if torrent_data is not None else getattr(torrent, "name", None)
                     if isinstance(torrent_name_value, str) and torrent_name_value:
                         prefetch_task = self._start_hash_metadata_prefetch(meta, torrent_name_value, str(content_path), comment_tracker_ids)
                     try:
                         await self._wait_for_qbittorrent_download(client_value, infohash)
                         if prefetch_task is not None:
-                            try:
-                                prefetched_meta = await prefetch_task
-                            except Exception as error:
-                                logger.debug(f"[yellow]Early metadata lookup failed: {error}[/yellow]")
-                            else:
-                                if prefetched_meta.tracker_search_attempted or prefetched_meta.imdb_tmdb_prefetch_completed:
-                                    meta.update(prefetched_meta)
-                                if prefetched_meta.tracker_search_attempted:
-                                    meta.tracker_prefetch_completed = True
-                                    meta.tracker_prefetch_search_term = torrent_name_value
-                                    meta.tracker_prefetch_category = prefetched_meta.tracker_prefetch_category
-                                    meta.tracker_prefetch_ids = dict(comment_tracker_ids)
+                            key = (str(meta.base_dir), infohash.lower())
+                            self._hash_metadata_prefetch_tasks[key] = (prefetch_task, meta.copy(), str(torrent_name_value), dict(comment_tracker_ids))
                     except BaseException:
                         if prefetch_task is not None and not prefetch_task.done():
                             prefetch_task.cancel()
                             await asyncio.gather(prefetch_task, return_exceptions=True)
                         raise
                 if not Path(resolved_path).exists():
+                    if prefetch_task is not None:
+                        prefetch_task.cancel()
+                        await asyncio.gather(prefetch_task, return_exceptions=True)
+                        self._hash_metadata_prefetch_tasks.pop((str(meta.base_dir), infohash.lower()), None)
                     raise ValueError(f"Resolved local content path does not exist: {resolved_path}")
                 meta.source_torrent_hash = infohash
                 meta.source_torrent_client = client_name
@@ -978,6 +974,49 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
         logger.info(f"[bold red]Torrent hash {infohash} was not found in the configured qBittorrent clients: {', '.join(client_names) or 'none'}")
         return None
+
+    async def finish_hash_metadata_prefetch(self, meta: Meta) -> None:
+        key = (str(meta.base_dir), str(meta.source_torrent_hash or "").lower())
+        pending = self._hash_metadata_prefetch_tasks.pop(key, None)
+        if pending is None:
+            return
+        task, original_meta, search_term, tracker_ids = pending
+        try:
+            prefetched_meta = await task
+        except Exception as error:
+            logger.debug(f"[yellow]Early metadata lookup failed: {error}[/yellow]")
+            return
+        if meta.edit or prefetched_meta.tracker_prefetch_category != meta.category:
+            return
+        identity_fields = ("imdb_id", "tmdb_id", "imdb_manual", "tmdb_manual", "manual_category", "no_imdb", "no_tmdb", "tracker_ids")
+
+        def equivalent(name: str, first: Any, second: Any) -> bool:
+            if name in {"imdb_id", "tmdb_id", "imdb_manual", "tmdb_manual"}:
+                return str(first or "0").removeprefix("tt").lstrip("0") == str(second or "0").removeprefix("tt").lstrip("0")
+            if name in {"no_imdb", "no_tmdb"}:
+                return bool(first) == bool(second)
+            return bool(first == second)
+
+        if any(not equivalent(name, meta.get(name), original_meta.get(name)) and not equivalent(name, meta.get(name), prefetched_meta.get(name)) for name in identity_fields):
+            return
+        if prefetched_meta.tracker_search_attempted or prefetched_meta.imdb_tmdb_prefetch_completed:
+            for name, value in prefetched_meta.items():
+                if value != original_meta.get(name) and equivalent(name, meta.get(name), original_meta.get(name)):
+                    meta[name] = value
+        if prefetched_meta.tracker_search_attempted:
+            meta.tracker_prefetch_completed = True
+            meta.tracker_prefetch_search_term = search_term
+            meta.tracker_prefetch_category = prefetched_meta.tracker_prefetch_category
+            meta.tracker_prefetch_ids = tracker_ids
+
+    @classmethod
+    async def cancel_hash_metadata_prefetch(cls, meta: Meta) -> None:
+        key = (str(meta.base_dir), str(meta.source_torrent_hash or "").lower())
+        pending = cls._hash_metadata_prefetch_tasks.pop(key, None)
+        if pending is not None:
+            task = pending[0]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _start_hash_metadata_prefetch(
         self,
@@ -1119,7 +1158,14 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
             prefetched_meta.imdb_tmdb_prefetch_untouched_filename = torrent_name
             return prefetched_meta
 
-        return asyncio.create_task(lookup())
+        async def prefetch() -> Meta:
+            prefetched_meta = await lookup()
+            from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
+
+            PassThePopcorn.start_group_prefetch(prefetched_meta, self.config)
+            return prefetched_meta
+
+        return asyncio.create_task(prefetch())
 
     async def get_ptp_from_hash(self, meta: Meta, pathed: bool = False, client_name: str | None = None) -> Meta:
         """Fetch PTP metadata through the configured torrent client when available."""

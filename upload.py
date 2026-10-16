@@ -2455,8 +2455,6 @@ async def do_the_thing(base_dir: str) -> None:
                 logger.info("")  # Blank line after warnings
 
         if meta.path and not Path(meta.path).expanduser().exists() and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", meta.path):
-            from src.clients import Clients
-
             try:
                 resolved_path = await Clients(config).resolve_qbittorrent_hash_path(meta, meta.path)
             except ValueError as exc:
@@ -2617,9 +2615,14 @@ async def do_the_thing(base_dir: str) -> None:
 
             try:
                 meta_success = await process_meta(meta, base_dir)
+            except BaseException:
+                await PassThePopcorn.cancel_prefetch(meta)
+                raise
             finally:
+                await Clients.cancel_hash_metadata_prefetch(meta)
                 await cancel_and_drain_early_artifact_tasks(meta.uuid)
             if not meta_success:
+                await PassThePopcorn.cancel_prefetch(meta)
                 set_stats_context(debug=bool(meta.debug), category=str(meta.category or ""))
                 await record_event_async("item", operation="completed", outcome="error")
                 await record_release_profile_async(meta, "error")
@@ -3023,6 +3026,7 @@ async def do_the_thing(base_dir: str) -> None:
                             else:
                                 await save_processed_file(log_file, current_item_path)
 
+            await PassThePopcorn.cancel_prefetch(meta)
             finish_time = time.time()
             logger.debug(f"Uploads processed in {finish_time - start_time:.4f} seconds")
 
@@ -3089,6 +3093,8 @@ async def do_the_thing(base_dir: str) -> None:
         cleanup_manager.reset_terminal()
 
     finally:
+        await Clients.cancel_hash_metadata_prefetch(meta)
+        await PassThePopcorn.cancel_prefetch(meta)
         current_release_log_path.set(None)
         if not sys.stdin.closed:
             cleanup_manager.reset_terminal()

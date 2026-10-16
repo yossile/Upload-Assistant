@@ -7,6 +7,7 @@ import json
 import platform
 import re
 import time
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
@@ -142,6 +143,149 @@ class PassThePopcorn:
     supported_categories = ("MOVIE",)
     torrent_policy = PASSTHEPOPCORN_POLICY
     tracker_urls = ("passthepopcorn.me",)
+    _prefetch_max_age = 3600.0
+    _group_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[tuple[str, str], float, asyncio.Task[str | None]]]] = {}
+    _title_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[Meta, float, asyncio.Task[dict[str, Any] | None]]]] = {}
+
+    @staticmethod
+    def _prefetch_key(meta: Meta) -> tuple[str, str]:
+        return str(meta.base_dir), str(meta.source_torrent_hash or meta.uuid)
+
+    @staticmethod
+    def _group_identity(meta: Meta) -> tuple[str, str] | None:
+        if meta.imdb_id and not meta.no_imdb:
+            return "imdb", str(meta.imdb_id).removeprefix("tt").zfill(7)
+        if meta.tmdb_id:
+            return "tmdb", str(meta.tmdb_id)
+        return None
+
+    @classmethod
+    def _can_prefetch(cls, meta: Meta, config: dict[str, Any]) -> bool:
+        selected = meta.trackers or config.get("TRACKERS", {}).get("default_trackers", "")
+        selected = selected.split(",") if isinstance(selected, str) else selected
+        return (
+            bool(meta.unattended)
+            and not meta.edit
+            and meta.category == "MOVIE"
+            and any(Meta.canonical_tracker_name(str(tracker).strip()) == cls.tracker for tracker in selected)
+            and bool(config.get("TRACKERS", {}).get(cls.tracker))
+        )
+
+    @classmethod
+    def start_group_prefetch(cls, meta: Meta, config: dict[str, Any]) -> None:
+        if not cls._can_prefetch(meta, config):
+            return
+        identity = cls._group_identity(meta)
+        if identity is None:
+            return
+        key = cls._prefetch_key(meta)
+        if key in cls._group_prefetch_tasks:
+            return
+
+        async def lookup() -> str | None:
+            try:
+                tracker = cls(config)
+                started_at = time.perf_counter()
+                group_id = await tracker._get_group_by_identifier(
+                    {identity[0]: identity[1], "json": "noredirect"},
+                    f"{identity[0].upper()}: {identity[1]}",
+                    "TmdbId" if identity[0] == "tmdb" else None,
+                    identity[1] if identity[0] == "tmdb" else None,
+                    allow_selection=False,
+                )
+                log_ptp_timing(meta, "early group lookup", started_at)
+                return group_id
+            except Exception as error:
+                logger.debug(f"{cls.tracker}: Early group lookup failed: {error}")
+                return None
+
+        cls._group_prefetch_tasks[key] = (identity, time.monotonic(), asyncio.create_task(lookup()))
+
+    @classmethod
+    async def cancel_group_prefetch(cls, meta: Meta) -> None:
+        pending = cls._group_prefetch_tasks.pop(cls._prefetch_key(meta), None)
+        if pending is not None:
+            task = pending[2]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def get_group_for_meta(self, meta: Meta) -> str | None:
+        pending = self._group_prefetch_tasks.pop(self._prefetch_key(meta), None)
+        identity = self._group_identity(meta)
+        if pending is not None:
+            cached_identity, started_at, task = pending
+            if identity == cached_identity and time.monotonic() - started_at < self._prefetch_max_age and not task.cancelled():
+                group_id = await task
+                if group_id is not None:
+                    return group_id
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if identity is None:
+            return None
+        if identity[0] == "imdb":
+            return await self.get_group_by_imdb(identity[1])
+        return await self.get_group_by_tmdb(identity[1])
+
+    @classmethod
+    def start_title_prefetch(cls, meta: Meta, config: dict[str, Any]) -> None:
+        if not cls._can_prefetch(meta, config) or cls._group_identity(meta) is None:
+            return
+        key = cls._prefetch_key(meta)
+        if key in cls._title_prefetch_tasks:
+            return
+        snapshot = meta.copy()
+        pending_group = cls._group_prefetch_tasks.get(key)
+
+        async def lookup() -> dict[str, Any] | None:
+            try:
+                if pending_group is not None and pending_group[0] == cls._group_identity(snapshot):
+                    group_id = await asyncio.shield(pending_group[2])
+                    if group_id is not None:
+                        return None
+                started_at = time.perf_counter()
+                result = await cls(config)._lookup_title_info(snapshot)
+                log_ptp_timing(meta, "early PTP title metadata lookup", started_at)
+                return result
+            except Exception as error:
+                logger.debug(f"{cls.tracker}: Early title metadata lookup failed: {error}")
+                return None
+
+        cls._title_prefetch_tasks[key] = (snapshot, time.monotonic(), asyncio.create_task(lookup()))
+
+    @classmethod
+    async def cancel_title_prefetch(cls, meta: Meta) -> None:
+        pending = cls._title_prefetch_tasks.pop(cls._prefetch_key(meta), None)
+        if pending is not None:
+            task = pending[2]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @classmethod
+    async def cancel_prefetch(cls, meta: Meta) -> None:
+        await cls.cancel_title_prefetch(meta)
+        await cls.cancel_group_prefetch(meta)
+
+    async def _lookup_title_info(self, meta: Meta) -> dict[str, Any]:
+        identity = self._group_identity(meta)
+        if identity is not None and identity[0] == "imdb":
+            return await self.get_torrent_info(identity[1], meta)
+        return await self.get_torrent_info_tmdb(meta)
+
+    async def get_title_info_for_meta(self, meta: Meta) -> dict[str, Any]:
+        pending = self._title_prefetch_tasks.pop(self._prefetch_key(meta), None)
+        if pending is not None:
+            snapshot, started_at, task = pending
+            fields = ("imdb_id", "tmdb_id", "no_imdb", "genres", "keywords", "imdb_info", "title", "year", "overview")
+            unchanged = all(meta.get(name) == snapshot.get(name) for name in fields)
+            if unchanged and time.monotonic() - started_at < self._prefetch_max_age and not task.cancelled():
+                result = await task
+                if result is not None:
+                    return result
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return await self._lookup_title_info(meta)
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -1490,6 +1634,42 @@ class PassThePopcorn:
         return logged_in
 
     async def fill_upload_form(self, group_id: int | str | None, meta: Meta) -> tuple[str, dict[str, Any]]:
+        self._prepared_upload_torrent: tuple[str, bytes] | None = None
+        prerequisites: dict[str, asyncio.Task[Any]] = {}
+
+        async def timed(stage: str, operation: Awaitable[Any]) -> Any:
+            started_at = time.perf_counter()
+            try:
+                return await operation
+            finally:
+                log_ptp_timing(meta, stage, started_at)
+
+        if meta.unattended and not meta.unattended_confirm:
+            prerequisites["csrf"] = asyncio.create_task(timed("session and CSRF token", self.get_anti_csrf_token(meta)))
+            if group_id is None:
+                snapshot = meta.copy()
+                prerequisites["metadata"] = asyncio.create_task(timed("PTP title metadata lookup", self.get_title_info_for_meta(snapshot)))
+                cover = select_ptp_cover_url(snapshot)
+                if cover is not None:
+                    prerequisites["poster"] = asyncio.create_task(timed("poster download and hosting", self.rehost_poster_to_selected_host(snapshot, cover)))
+        form_task = asyncio.create_task(self._fill_upload_form(group_id, meta, prerequisites))
+        torrent_task = asyncio.create_task(self._prepare_upload_torrent(meta))
+        tasks = [form_task, torrent_task, *prerequisites.values()]
+        try:
+            form, torrent_bytes = await asyncio.gather(form_task, torrent_task)
+            torrent_path = str(Path(meta.base_dir) / "tmp" / meta.uuid / f"[{self.tracker}].torrent")
+            self._prepared_upload_torrent = torrent_path, torrent_bytes
+            return form
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.cancel_prefetch(meta)
+
+    async def _fill_upload_form(
+        self, group_id: int | str | None, meta: Meta, prerequisites: dict[str, asyncio.Task[Any]]
+    ) -> tuple[str, dict[str, Any]]:
         resolution, other_resolution = self.get_resolution(meta)
         description_started_at = time.perf_counter()
         await self.edit_desc(meta)
@@ -1563,8 +1743,11 @@ class PassThePopcorn:
         logger.debug(f"{self.tracker}: ptp_trumpable: {ptp_trumpable}")
         logger.debug(f"{self.tracker}: ptp_subtitles: {ptp_subtitles}")
         csrf_started_at = time.perf_counter()
-        anti_csrf_token = await self.get_anti_csrf_token(meta)
-        log_ptp_timing(meta, "session and CSRF token", csrf_started_at)
+        if "csrf" in prerequisites:
+            anti_csrf_token = await prerequisites["csrf"]
+        else:
+            anti_csrf_token = await self.get_anti_csrf_token(meta)
+            log_ptp_timing(meta, "session and CSRF token", csrf_started_at)
         data: dict[str, Any] = {
             "submit": "true",
             "remaster_year": "",
@@ -1601,14 +1784,12 @@ class PassThePopcorn:
             data["imdb"] = str(imdb_id_int).zfill(7)
         if group_id is None:  # If need to make new group
             url = f"{self.base_url}/upload.php"
-            if data["imdb"] == "0":
-                metadata_started_at = time.perf_counter()
-                tinfo = await self.get_torrent_info_tmdb(meta)
+            if "metadata" in prerequisites:
+                tinfo = await prerequisites["metadata"]
             else:
-                imdb_value = meta.imdb or "0"
                 metadata_started_at = time.perf_counter()
-                tinfo = await self.get_torrent_info(imdb_value, meta)
-            log_ptp_timing(meta, "PTP title metadata lookup", metadata_started_at)
+                tinfo = await self.get_title_info_for_meta(meta)
+                log_ptp_timing(meta, "PTP title metadata lookup", metadata_started_at)
             if meta.youtube is None or "youtube" not in meta.youtube:
                 youtube = (
                     ""
@@ -1619,7 +1800,9 @@ class PassThePopcorn:
                 )
                 meta.youtube = youtube
             cover = select_ptp_cover_url(meta)
-            if cover is not None:
+            if "poster" in prerequisites:
+                cover = await prerequisites["poster"]
+            elif cover is not None:
                 poster_started_at = time.perf_counter()
                 cover = await self.rehost_poster_to_selected_host(meta, cover)
                 log_ptp_timing(meta, "poster download and hosting", poster_started_at)
@@ -1695,14 +1878,15 @@ class PassThePopcorn:
         message = re.sub(r"\s+", " ", alert.get_text(" ", strip=True))
         return re.sub(r"\s+([.,!?;:])", r"\1", message)
 
-    async def upload(self, meta: Meta, url: str, data: dict[str, Any]) -> bool:
+    async def _prepare_upload_torrent(self, meta: Meta) -> bytes:
         common = Common(config=self.config)
         torrent_file_path = f"{meta.base_dir}{'/' + 'tmp' + '/'}{meta.uuid}/[{self.tracker}].torrent"
         torrent_started_at = time.perf_counter()
         await common.create_torrent_for_upload(meta, self.tracker, self.source_flag)
         log_ptp_timing(meta, "torrent file creation", torrent_started_at)
 
-        invalid_paths = self._find_non_ascii_torrent_paths(Torrent.read(torrent_file_path))
+        torrent = await asyncio.to_thread(Torrent.read, torrent_file_path)
+        invalid_paths = self._find_non_ascii_torrent_paths(torrent)
         if invalid_paths:
             paths = ", ".join(repr(path) for path in invalid_paths)
             raise UploadError(
@@ -1710,9 +1894,18 @@ class PassThePopcorn:
                 "Rename the files to use ASCII characters and recreate the torrent."
             )
 
-        # Proceed with the upload process
         async with aiofiles.open(torrent_file_path, "rb") as torrent_file_handle:
-            torrent_bytes = await torrent_file_handle.read()
+            return await torrent_file_handle.read()
+
+    async def upload(self, meta: Meta, url: str, data: dict[str, Any]) -> bool:
+        common = Common(config=self.config)
+        torrent_file_path = str(Path(meta.base_dir) / "tmp" / meta.uuid / f"[{self.tracker}].torrent")
+        prepared = getattr(self, "_prepared_upload_torrent", None)
+        self._prepared_upload_torrent = None
+        if prepared is not None and prepared[0] == torrent_file_path:
+            torrent_bytes = prepared[1]
+        else:
+            torrent_bytes = await self._prepare_upload_torrent(meta)
         files = {"file_input": ("placeholder.torrent", torrent_bytes, "application/x-bittorent")}
         headers = {
             # 'ApiUser' : self.api_user,

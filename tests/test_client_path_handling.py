@@ -405,7 +405,6 @@ async def test_hash_wait_prefetches_tracker_ids_and_carries_them_forward(tmp_pat
     async def wait_for_download(*_args):
         await asyncio.wait_for(tracker_started.wait(), timeout=2)
         assert not tracker_finished.is_set()
-        finish_tracker.set()
 
     with (
         patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)),
@@ -422,9 +421,15 @@ async def test_hash_wait_prefetches_tracker_ids_and_carries_them_forward(tmp_pat
                 "category": "MOVIE",
             }
         )
-        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+        resolved = await asyncio.wait_for(clients.resolve_qbittorrent_hash_path(meta, infohash), timeout=2)
+        assert not tracker_finished.is_set()
+        meta.resolution = "1080p"
+        meta.imdb_id = 0
+        finish_tracker.set()
+        await Clients(clients.config).finish_hash_metadata_prefetch(meta)
 
     assert resolved == str(media)
+    assert meta.resolution == "1080p"
     assert meta.imdb_id == 12345
     assert meta.matched_tracker == "PASSTHEPOPCORN"
     assert meta.tracker_prefetch_completed is True
@@ -480,7 +485,6 @@ async def test_hash_wait_prefetches_imdb_tmdb_without_trackers(tmp_path: Path) -
 
     async def wait_for_download(*_args):
         await asyncio.wait_for(asyncio.gather(tmdb_started.wait(), imdb_started.wait()), timeout=2)
-        finish_lookups.set()
 
     with (
         patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)),
@@ -498,7 +502,9 @@ async def test_hash_wait_prefetches_imdb_tmdb_without_trackers(tmp_path: Path) -
                 "category": "MOVIE",
             }
         )
-        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+        resolved = await asyncio.wait_for(clients.resolve_qbittorrent_hash_path(meta, infohash), timeout=2)
+        finish_lookups.set()
+        await clients.finish_hash_metadata_prefetch(meta)
 
     assert resolved == str(media)
     assert meta.tmdb_id == 272726
@@ -506,6 +512,46 @@ async def test_hash_wait_prefetches_imdb_tmdb_without_trackers(tmp_path: Path) -
     assert meta.imdb_tmdb_prefetch_completed is True
     assert tmdb_search.await_count == 1
     assert imdb_search.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_field, value", [("imdb_id", 99999), ("category", "TV"), ("edit", True), ("no_imdb", True), ("imdb_manual", "99999")])
+async def test_delayed_hash_prefetch_rejects_changed_identity(changed_field, value):
+    client = Clients({})
+    meta = Meta(base_dir="test-delayed-prefetch", source_torrent_hash="a" * 40, category="MOVIE")
+    original = meta.copy()
+    prefetched = meta.copy()
+    prefetched.imdb_id = 12345
+    prefetched.tracker_search_attempted = True
+    prefetched.tracker_prefetch_category = "MOVIE"
+    task = asyncio.create_task(AsyncMock(return_value=prefetched)())
+    client._hash_metadata_prefetch_tasks[(meta.base_dir, meta.source_torrent_hash)] = (task, original, "Release", {})
+    meta[changed_field] = value
+
+    await client.finish_hash_metadata_prefetch(meta)
+
+    assert not meta.tracker_prefetch_completed
+    assert meta.imdb_id == (99999 if changed_field == "imdb_id" else original.imdb_id)
+    assert not client._hash_metadata_prefetch_tasks
+
+
+@pytest.mark.asyncio
+async def test_delayed_hash_prefetch_cancellation_drains_task():
+    started = asyncio.Event()
+    client = Clients({})
+    meta = Meta(base_dir="test-delayed-prefetch", source_torrent_hash="a" * 40)
+
+    async def lookup():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(lookup())
+    client._hash_metadata_prefetch_tasks[(meta.base_dir, meta.source_torrent_hash)] = (task, meta.copy(), "Release", {})
+    await started.wait()
+    await client.cancel_hash_metadata_prefetch(meta)
+
+    assert task.cancelled()
+    assert not client._hash_metadata_prefetch_tasks
 
 
 def test_tracker_prefetch_reuse_requires_matching_search_inputs() -> None:

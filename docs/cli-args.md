@@ -269,6 +269,12 @@ See [Upload Order and qBittorrent Bandwidth Control](upload-order-and-bandwidth-
 - `-ffdebug`, `--ffdebug`: Show debugging info from ffmpeg while taking screenshots.
 - `-uptimer`, `--upload-timer`: Print time to upload to each site.
 
+For unattended qBittorrent hash inputs, metadata lookup overlaps the download and
+media preparation. PTP group lookup can start once an IMDb/TMDb ID is available;
+new-group title metadata can overlap later preparation. Changed IDs or title/tag
+inputs invalidate prefetched results. Request pacing and duplicate checks remain
+in place.
+
 ## VapourSynth screenshots
 
 - `-vs`, `--vapoursynth`: Use VapourSynth for screenshots (requires VS install). NOTE: probably broken.

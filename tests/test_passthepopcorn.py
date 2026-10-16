@@ -1,11 +1,13 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
+from src.artwork import select_ptp_cover_url
 from src.meta import Meta
 from src.tracker_images import set_tracker_image_collection
-from src.artwork import select_ptp_cover_url
 from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
 
@@ -148,3 +150,169 @@ def test_disc_menu_images_precede_movie_screenshots_in_description() -> None:
 
     assert tracker._description_images(meta) == [rehosted_menu, meta.image_list[0]]  # noqa: S101
     assert tracker._description_image_limit(meta, 6) == 7  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_id, result, expired, expected", [(False, "1234", False, "1234"), (True, "1234", False, "5678"), (False, None, False, "5678"), (False, "1234", True, "5678")])
+async def test_group_prefetch_reuses_only_fresh_positive_identity_matches(monkeypatch, changed_id, result, expired, expected):
+    import time
+
+    tracker = object.__new__(PassThePopcorn)
+    tracker.get_group_by_imdb = AsyncMock(return_value="5678")
+    meta = Meta(base_dir="test-group-prefetch", uuid="release", imdb_id=12345)
+    task = asyncio.create_task(AsyncMock(return_value=result)())
+    age = tracker._prefetch_max_age + 1 if expired else 300
+    PassThePopcorn._group_prefetch_tasks[tracker._prefetch_key(meta)] = (tracker._group_identity(meta), time.monotonic() - age, task)
+    if changed_id:
+        meta.imdb_id = 99999
+
+    assert await tracker.get_group_for_meta(meta) == expected  # noqa: S101
+    assert tracker.get_group_by_imdb.await_count == (0 if expected == "1234" else 1)  # noqa: S101
+    assert not PassThePopcorn._group_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_early_group_lookup_is_noninteractive_and_cancelled(monkeypatch):
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def lookup(*args, **kwargs):
+        assert kwargs["allow_selection"] is False  # noqa: S101
+        started.set()
+        await blocked.wait()
+
+    monkeypatch.setattr(PassThePopcorn, "_get_group_by_identifier", lookup)
+    meta = Meta(base_dir="test-group-prefetch", uuid="release", imdb_id=12345, category="MOVIE", unattended=True, trackers=["PASSTHEPOPCORN"])
+    PassThePopcorn.start_group_prefetch(meta, {"DEFAULT": {}, "TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+    task = PassThePopcorn._group_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await PassThePopcorn.cancel_group_prefetch(meta)
+
+    assert task.cancelled()  # noqa: S101
+    assert not PassThePopcorn._group_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_form_and_torrent_preparation_overlap_and_cache_bytes():
+    tracker = object.__new__(PassThePopcorn)
+    torrent_started = asyncio.Event()
+    form_started = asyncio.Event()
+
+    async def form(*_args):
+        form_started.set()
+        await torrent_started.wait()
+        return "upload-url", {"groupid": "1234"}
+
+    async def torrent(*_args):
+        torrent_started.set()
+        await form_started.wait()
+        return b"torrent"
+
+    tracker._fill_upload_form = form
+    tracker._prepare_upload_torrent = torrent
+    meta = Meta(base_dir="test", uuid="release")
+    result = await asyncio.wait_for(tracker.fill_upload_form("1234", meta), timeout=2)
+
+    assert result == ("upload-url", {"groupid": "1234"})  # noqa: S101
+    assert tracker._prepared_upload_torrent == ("test/tmp/release/[PASSTHEPOPCORN].torrent", b"torrent")  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_form_failure_cancels_torrent_preparation():
+    tracker = object.__new__(PassThePopcorn)
+    torrent_started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def form(*_args):
+        await torrent_started.wait()
+        raise ValueError("invalid form")
+
+    async def torrent(*_args):
+        torrent_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    tracker._fill_upload_form = form
+    tracker._prepare_upload_torrent = torrent
+    with pytest.raises(ValueError, match="invalid form"):
+        await asyncio.wait_for(tracker.fill_upload_form("1234", Meta()), timeout=2)
+
+    assert cancelled.is_set()  # noqa: S101
+    assert tracker._prepared_upload_torrent is None  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_id, changed_genres, expected_calls", [(None, False, 1), ("1234", False, 0), (None, True, 2)])
+async def test_title_prefetch_skips_existing_groups_and_rejects_changed_tags(monkeypatch, group_id, changed_genres, expected_calls):
+    import time
+
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda self, config: None)
+    title_lookup = AsyncMock(return_value={"title": "Example", "tags": "drama"})
+    monkeypatch.setattr(PassThePopcorn, "_lookup_title_info", title_lookup)
+    meta = Meta(base_dir="test-title-prefetch", uuid="release", category="MOVIE", unattended=True, trackers=["PASSTHEPOPCORN"], imdb_id=12345, genres=["Drama"])
+    key = PassThePopcorn._prefetch_key(meta)
+    group_task = asyncio.create_task(AsyncMock(return_value=group_id)())
+    PassThePopcorn._group_prefetch_tasks[key] = (PassThePopcorn._group_identity(meta), time.monotonic(), group_task)
+    PassThePopcorn.start_title_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+    await asyncio.wait_for(PassThePopcorn._title_prefetch_tasks[key][2], timeout=2)
+    if changed_genres:
+        meta.genres = ["Comedy"]
+    try:
+        if group_id is None:
+            result = await PassThePopcorn({}).get_title_info_for_meta(meta)
+            assert result["title"] == "Example"  # noqa: S101
+        assert title_lookup.await_count == expected_calls  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+    assert not PassThePopcorn._title_prefetch_tasks  # noqa: S101
+    assert not PassThePopcorn._group_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_unattended_form_prerequisites_overlap_without_mutating_live_host(monkeypatch):
+    tracker = object.__new__(PassThePopcorn)
+    started = {stage: asyncio.Event() for stage in ("csrf", "metadata", "poster", "torrent")}
+    release = asyncio.Event()
+    meta = Meta(unattended=True, base_dir="test", uuid="release", imdb_id=12345, imghost="imgbb")
+
+    async def csrf(_meta):
+        started["csrf"].set()
+        await release.wait()
+        return "token"
+
+    async def metadata(_meta):
+        started["metadata"].set()
+        await release.wait()
+        return {"title": "Example"}
+
+    async def poster(snapshot, _cover):
+        snapshot.imghost = "ptscreens"
+        started["poster"].set()
+        await release.wait()
+        return "https://images.example/rehosted.jpg"
+
+    async def torrent(_meta):
+        started["torrent"].set()
+        await release.wait()
+        return b"torrent"
+
+    async def form(_group_id, _meta, prerequisites):
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        assert meta.imghost == "imgbb"  # noqa: S101
+        release.set()
+        results = await asyncio.gather(*(prerequisites[name] for name in ("csrf", "metadata", "poster")))
+        assert results == ["token", {"title": "Example"}, "https://images.example/rehosted.jpg"]  # noqa: S101
+        return "url", {}
+
+    tracker.get_anti_csrf_token = csrf
+    tracker.get_title_info_for_meta = metadata
+    tracker.rehost_poster_to_selected_host = poster
+    tracker._prepare_upload_torrent = torrent
+    tracker._fill_upload_form = form
+    monkeypatch.setattr("src.trackers.GAZELLE.passthepopcorn.select_ptp_cover_url", lambda _meta: "https://images.example/poster.jpg")
+
+    assert await asyncio.wait_for(tracker.fill_upload_form(None, meta), timeout=2) == ("url", {})  # noqa: S101
+    assert meta.imghost == "imgbb"  # noqa: S101

@@ -14,6 +14,7 @@ from src.metadata_cache import set_run_disabled
 from src.ptp_timing import log_ptp_timing
 from src.screenshot_manifest import files as manifest_files
 from src.stats import stats_collection_enabled
+from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
 console: Any = None
 
@@ -263,6 +264,7 @@ class Prep:
         stage_started_at = time.perf_counter()
         await prep_helpers.finalize_metadata(self, meta, videopath, bdinfo, mi, filename, untouched_filename, video)
         self._log_ptp_timing(meta, "metadata finalization", stage_started_at)
+        PassThePopcorn.start_group_prefetch(meta, self.config)
 
         stage_started_at = time.perf_counter()
         await prepare_artwork(meta)
@@ -281,6 +283,7 @@ class Prep:
                 meta.localized_overviews = {}
         if meta.manual_genres:
             meta.genres = [genre.strip() for genre in meta.manual_genres.split(",") if genre.strip()]
+        PassThePopcorn.start_title_prefetch(meta, self.config)
 
         # Ensure the background capture is complete before the upload stage
         # starts consuming the generated files. Any error is logged by the
