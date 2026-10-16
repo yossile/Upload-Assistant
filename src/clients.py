@@ -857,19 +857,8 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
         if isinstance(requested_client, str) and requested_client and requested_client != "none":
             client_names = [requested_client]
         else:
-            client_names = coerce_str_list(default_config.get("searching_client_list", []))
             default_client = default_config.get("default_torrent_client")
-            if isinstance(default_client, str) and default_client and default_client != "none" and default_client not in client_names:
-                client_names.append(default_client)
-            for configured_name, configured_client in cast(dict[str, Any], clients_config).items():
-                client_name = str(configured_name)
-                configured_client = cast(dict[str, Any], configured_client) if isinstance(configured_client, dict) else None
-                if (
-                    client_name not in client_names
-                    and configured_client is not None
-                    and str(configured_client.get("torrent_client", "")).lower() == "qbit"
-                ):
-                    client_names.append(client_name)
+            client_names = [default_client] if isinstance(default_client, str) and default_client and default_client != "none" else []
 
         for client_name in client_names:
             client_value = clients_config.get(client_name)

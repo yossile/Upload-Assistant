@@ -215,7 +215,7 @@ async def test_resolve_qbittorrent_hash_path_maps_content_path(tmp_path: Path) -
     infohash = "a" * 40
     client = Clients(
         {
-            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "DEFAULT": {"default_torrent_client": "qbit"},
             "TORRENT_CLIENTS": {
                 "qbit": {
                     "torrent_client": "qbit",
@@ -269,21 +269,32 @@ async def test_resolve_qbittorrent_hash_path_maps_content_path(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_resolve_qbittorrent_hash_checks_other_configured_clients(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("searching_clients", "requested_client", "expected_clients"),
+    [
+        ([], None, ["default"]),
+        (["", "none"], None, ["default"]),
+        (["search"], None, ["default"]),
+        (["missing", "search"], None, ["default"]),
+        (["search"], "explicit", ["explicit"]),
+    ],
+)
+async def test_resolve_qbittorrent_hash_respects_client_selection(tmp_path: Path, searching_clients, requested_client, expected_clients) -> None:
     media = tmp_path / "downloads" / "Release" / "movie.mkv"
     media.parent.mkdir(parents=True)
     media.write_bytes(b"media")
     infohash = "b" * 40
+    client_names = ["other", "default", "missing", "search", "explicit"]
     clients = Clients(
         {
-            "DEFAULT": {"searching_client_list": ["search"], "default_torrent_client": "search"},
+            "DEFAULT": {"searching_client_list": searching_clients, "default_torrent_client": "default"},
             "TORRENT_CLIENTS": {
-                "search": {"torrent_client": "qbit"},
-                "actual": {
+                name: {
                     "torrent_client": "qbit",
                     "local_path": str(tmp_path / "downloads"),
                     "remote_path": "/remote/downloads",
-                },
+                }
+                for name in client_names
             },
         }
     )
@@ -293,12 +304,34 @@ async def test_resolve_qbittorrent_hash_checks_other_configured_clients(tmp_path
     )
 
     async def init_client(client_config):
-        return search_client if client_config.get("torrent_client") == "qbit" and "local_path" not in client_config else actual_client
+        return search_client if client_config is clients.config["TORRENT_CLIENTS"]["missing"] else actual_client
 
-    with patch.object(clients, "init_qbittorrent_client", AsyncMock(side_effect=init_client)):
-        resolved = await clients.resolve_qbittorrent_hash_path(Meta(), infohash)
+    meta = Meta(client=requested_client)
+    with patch.object(clients, "init_qbittorrent_client", AsyncMock(side_effect=init_client)) as initialize:
+        resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
 
     assert resolved == str(media)
+    assert meta.source_torrent_client == expected_clients[-1]
+    assert initialize.await_args_list == [((clients.config["TORRENT_CLIENTS"][name],), {}) for name in expected_clients]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("searching_clients", [[], ["search"]])
+@pytest.mark.parametrize("requested_client", [None, "explicit"])
+async def test_resolve_qbittorrent_hash_does_not_search_unselected_clients(searching_clients, requested_client) -> None:
+    clients = Clients(
+        {
+            "DEFAULT": {"searching_client_list": searching_clients, "default_torrent_client": "default"},
+            "TORRENT_CLIENTS": {name: {"torrent_client": "qbit"} for name in ["search", "default", "other", "explicit"]},
+        }
+    )
+    qbt_client = SimpleNamespace(torrents_info=lambda **_kwargs: [])
+    with patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)) as initialize:
+        resolved = await clients.resolve_qbittorrent_hash_path(Meta(client=requested_client), "b" * 40)
+
+    assert resolved is None
+    selected = requested_client or "default"
+    initialize.assert_awaited_once_with(clients.config["TORRENT_CLIENTS"][selected])
 
 
 @pytest.mark.asyncio
@@ -314,7 +347,7 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
     }
     clients = Clients(
         {
-            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "DEFAULT": {"default_torrent_client": "qbit"},
             "TORRENT_CLIENTS": {"qbit": client_config},
         }
     )
@@ -367,7 +400,7 @@ async def test_hash_wait_prefetches_tracker_ids_and_carries_them_forward(tmp_pat
     }
     clients = Clients(
         {
-            "DEFAULT": {"searching_client_list": ["qbit"]},
+            "DEFAULT": {"default_torrent_client": "qbit"},
             "TORRENT_CLIENTS": {"qbit": client_config},
         }
     )
@@ -452,7 +485,7 @@ async def test_hash_wait_prefetches_imdb_tmdb_without_trackers(tmp_path: Path) -
     }
     clients = Clients(
         {
-            "DEFAULT": {"searching_client_list": ["qbit"], "tracker_description_mode": "ids", "tmdb_api": "test-api-key"},
+            "DEFAULT": {"default_torrent_client": "qbit", "tracker_description_mode": "ids", "tmdb_api": "test-api-key"},
             "TORRENT_CLIENTS": {"qbit": client_config},
         }
     )
