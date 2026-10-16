@@ -97,7 +97,7 @@ from src.cleanup import cleanup_manager
 from src.clients import Clients
 from src.cogs.redaction import PathAwareEncoder, Redaction
 from src.config_helpers import format_terminal_link, parse_bool
-from src.console import current_release_log_path, logger  # pyright: ignore[reportUnknownVariableType]
+from src.console import current_release_log_path, enable_console_timestamps, logger  # pyright: ignore[reportUnknownVariableType]
 from src.console import rich_handler as _rich_handler
 from src.disc_menus import process_disc_menus
 from src.dupe_checking import DupeChecker
@@ -2453,6 +2453,9 @@ async def do_the_thing(base_dir: str) -> None:
                 for warning_str in grouped:
                     logger.info(f"[yellow]  ⚠ {warning_str}[/yellow]")
                 logger.info("")  # Blank line after warnings
+
+        if meta.benchmark:
+            enable_console_timestamps()
 
         if meta.path and not Path(meta.path).expanduser().exists() and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", meta.path):
             try:

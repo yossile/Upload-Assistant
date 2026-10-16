@@ -265,9 +265,12 @@ See [Upload Order and qBittorrent Bandwidth Control](upload-order-and-bandwidth-
 ## Debugging / output
 
 - `-debug`, `--debug`: Debug mode; runs through motions without uploading.
-- `--benchmark`: Print granular PTP stage timings while performing a normal upload.
+- `--benchmark`: Print granular PTP stage timings and enable millisecond console timestamps while performing a normal upload.
 - `-ffdebug`, `--ffdebug`: Show debugging info from ffmpeg while taking screenshots.
 - `-uptimer`, `--upload-timer`: Print time to upload to each site.
+
+Set `DEFAULT.console_show_time` to `True` to show `HH:MM:SS.mmm` timestamps on
+every console log line without enabling benchmark mode.
 
 PTP's upload timer measures submission and response validation, excluding form
 preparation, torrent preparation, and subsequent client setup. Use `--benchmark`

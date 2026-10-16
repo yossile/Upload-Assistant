@@ -1,11 +1,13 @@
 # ruff: noqa: S101
 import asyncio
 import io
+import logging
+from datetime import datetime
 from io import StringIO
 
 from rich.console import Console
 
-from src.console import _safe_input, ansi_to_html, buffer_console_logs, prompt_in_thread
+from src.console import _format_log_time, _safe_input, ansi_to_html, buffer_console_logs, enable_console_timestamps, prompt_in_thread, rich_handler
 
 
 class ByteInput:
@@ -44,6 +46,26 @@ def test_prompt_in_thread_returns_prompt_result() -> None:
         return await prompt_in_thread(lambda prefix, value: f"{prefix}{value}", "answer-", 42)
 
     assert asyncio.run(ask()) == "answer-42"
+
+
+def test_log_time_format_includes_milliseconds() -> None:
+    timestamp = datetime(2026, 10, 14, 12, 34, 56, 123456)
+
+    assert _format_log_time(timestamp).plain == "12:34:56.123"
+
+
+def test_console_timestamps_appear_on_repeated_log_times(monkeypatch) -> None:
+    stream = StringIO()
+    monkeypatch.setattr(rich_handler, "console", Console(file=stream, width=120))
+    monkeypatch.setattr(rich_handler._log_render, "show_time", False)
+    enable_console_timestamps()
+    record = logging.LogRecord("test", logging.INFO, "test", 1, "Stage completed", (), None)
+    record.created = 1234567890.123
+    rich_handler.emit(record)
+    rich_handler.emit(record)
+
+    timestamp = _format_log_time(datetime.fromtimestamp(record.created)).plain
+    assert stream.getvalue().count(timestamp) == 2
 
 
 def test_buffer_console_logs_can_contend_across_consecutive_event_loops() -> None:

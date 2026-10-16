@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 from collections.abc import AsyncGenerator, Callable, Generator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -204,15 +205,25 @@ except ImportError:
 
 # RichHandler captures logs and outputs them using our shared console instance.
 # We enable markup=True to preserve Rich color formatting like [yellow], [red], etc.
+def _format_log_time(timestamp: datetime) -> Text:
+    return Text(timestamp.strftime("%H:%M:%S.%f")[:-3])
+
+
 rich_handler = RichHandler(
     console=console,
     show_time=bool(config_default.get("console_show_time", False)),
     show_level=bool(config_default.get("console_show_level", False)),
     show_path=bool(config_default.get("console_show_path", False)),
     markup=bool(config_default.get("console_markup", True)),
+    log_time_format=_format_log_time,
 )
+rich_handler._log_render.omit_repeated_times = False
 rich_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(rich_handler)
+
+
+def enable_console_timestamps() -> None:
+    rich_handler._log_render.show_time = True
 
 
 class LogBufferHandler(logging.Handler):
