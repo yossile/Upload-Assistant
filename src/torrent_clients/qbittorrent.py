@@ -241,7 +241,7 @@ class QbittorrentClientMixin:
                     progress_displayed = False
                     logger.info(f"[green]Torrent {torrent_hash} has completed downloading.[/green]")
                     return
-                await asyncio.sleep(1)
+                await asyncio.sleep(5 if progress < 0.9 else 1)
         finally:
             if progress_displayed:
                 console.print()

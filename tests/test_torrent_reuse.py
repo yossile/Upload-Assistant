@@ -464,8 +464,15 @@ async def test_incomplete_qbit_preflight_waits_for_matching_hash(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_qbit_wait_polls_only_the_matching_hash_until_complete(monkeypatch):
-    states = iter([SimpleNamespace(state="downloading", progress=0.5), SimpleNamespace(state="seeding", progress=1.0)])
+    states = iter([
+        SimpleNamespace(state="downloading", progress=0.5),
+        SimpleNamespace(state="downloading", progress=0.899),
+        SimpleNamespace(state="downloading", progress=0.9),
+        SimpleNamespace(state="downloading", progress=0.95),
+        SimpleNamespace(state="seeding", progress=1.0),
+    ])
     queried_hashes = []
+    poll_intervals = []
     qbt_client = SimpleNamespace(torrents_info=lambda **kwargs: queried_hashes.append(kwargs["hashes"]) or [next(states)])
     clients = Clients({"DEFAULT": {}, "TORRENT_CLIENTS": {}})
 
@@ -475,8 +482,8 @@ async def test_qbit_wait_polls_only_the_matching_hash_until_complete(monkeypatch
     async def retry(operation, *_args, **_kwargs):
         return await operation()
 
-    async def no_wait(_interval):
-        return None
+    async def no_wait(interval):
+        poll_intervals.append(interval)
 
     printed = []
 
@@ -491,8 +498,9 @@ async def test_qbit_wait_polls_only_the_matching_hash_until_complete(monkeypatch
 
     await clients._wait_for_qbittorrent_download({"torrent_client": "qbit"}, "matched-hash")
 
-    assert queried_hashes == ["matched-hash", "matched-hash"]  # noqa: S101
-    assert ["50.0%" in line for line, _ in printed] == [True, False]  # noqa: S101
+    assert queried_hashes == ["matched-hash"] * 5  # noqa: S101
+    assert poll_intervals == [5, 5, 1, 1]  # noqa: S101
+    assert ["50.0%" in line for line, _ in printed] == [True, False, False, False, False]  # noqa: S101
     assert "100.0%" in printed[-1][0]  # noqa: S101
     assert all(kwargs.get("end") == "\r" for _, kwargs in printed)  # noqa: S101
 
@@ -507,20 +515,25 @@ async def test_qbit_proxy_wait_retries_timeout_until_torrent_completes(monkeypat
             self.calls += 1
             if self.calls == 1:
                 raise httpx.ReadTimeout("proxy timed out", request=httpx.Request("GET", "https://proxy.invalid/api/v2/torrents/info"))
+            if self.calls == 2:
+                return SimpleNamespace(status_code=200, json=lambda: [{"state": "downloading", "progress": 0.899}])
+            if self.calls == 3:
+                return SimpleNamespace(status_code=200, json=lambda: [{"state": "downloading", "progress": 0.9}])
             return SimpleNamespace(status_code=200, json=lambda: [{"state": "seeding", "progress": 1.0}])
 
         async def aclose(self):
             return None
 
     session = FakeSession()
+    poll_intervals = []
     clients = Clients({"DEFAULT": {}, "TORRENT_CLIENTS": {}})
 
     class FakeAsyncClient:
         def __new__(cls, **_kwargs):
             return session
 
-    async def no_wait(_interval):
-        return None
+    async def no_wait(interval):
+        poll_intervals.append(interval)
 
     printed = []
 
@@ -535,7 +548,8 @@ async def test_qbit_proxy_wait_retries_timeout_until_torrent_completes(monkeypat
 
     await clients._wait_for_qbittorrent_download({"qui_proxy_url": "https://proxy.invalid"}, "matched-hash")
 
-    assert session.calls == 2  # noqa: S101
+    assert session.calls == 4  # noqa: S101
+    assert poll_intervals == [1, 5, 1]  # noqa: S101
     assert any("100.0%" in line for line, _kwargs in printed)  # noqa: S101
 
 
