@@ -269,6 +269,12 @@ See [Upload Order and qBittorrent Bandwidth Control](upload-order-and-bandwidth-
 - `-ffdebug`, `--ffdebug`: Show debugging info from ffmpeg while taking screenshots.
 - `-uptimer`, `--upload-timer`: Print time to upload to each site.
 
+PTP's upload timer measures submission and response validation, excluding form
+preparation, torrent preparation, and subsequent client setup. Use `--benchmark`
+to see those stages separately. PTP success is reported before the local torrent
+is finalized and added to the client; seeding setup failures are reported separately
+and do not change the accepted upload's success status.
+
 For unattended qBittorrent hash inputs, metadata lookup overlaps the download and
 media preparation. PTP group lookup can start once an IMDb/TMDb ID is available;
 new-group title metadata can overlap later preparation. Changed IDs or title/tag

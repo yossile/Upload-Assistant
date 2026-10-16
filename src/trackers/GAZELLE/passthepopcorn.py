@@ -1938,16 +1938,12 @@ class PassThePopcorn:
                 log_ptp_timing(meta, "upload HTTP request", request_started_at)
         logger.info(f"{self.tracker}: [cyan]{response.url}")
         responsetext = response.text
-        error_message = self._extract_upload_error_message(responsetext)
-        # If the response contains our announce URL, then we are on the upload page and the upload wasn't successful.
-        if responsetext.find(self.announce_url) != -1:
-            async with aiofiles.open(failure_path, "w", encoding="utf-8") as f:
-                await f.write(responsetext)
 
         # URL format in case of successful upload: https://passthepopcorn.me/torrents.php?id=9329&torrentid=91868
         expected_host = urlparse(self.base_url).netloc
         match = re.match(rf".*?{re.escape(expected_host)}/torrents\.php\?id=(\d+)&torrentid=(\d+)", str(response.url))
         if match is None:
+            error_message = self._extract_upload_error_message(responsetext)
             async with aiofiles.open(failure_path, "w", encoding="utf-8") as f:
                 await f.write(responsetext)
             status_message = f"data error: see {failure_path}"
@@ -1956,9 +1952,20 @@ class PassThePopcorn:
             meta.tracker_status[self.tracker]["status_message"] = status_message
             return False
 
-        # having UA add the torrent link as a comment.
         if match:
-            meta.tracker_status[self.tracker]["status_message"] = str(response.url)
-            await common.create_torrent_ready_to_seed(meta, self.tracker, self.source_flag, self.announce_url, str(response.url))
+            status = meta.tracker_status[self.tracker]
+            status["status_message"] = str(response.url)
+            status["upload_success"] = True
             return True
         return False
+
+    async def prepare_for_seeding(self, meta: Meta) -> None:
+        if meta.debug:
+            return
+        started_at = time.perf_counter()
+        try:
+            await Common(config=self.config).create_torrent_ready_to_seed(
+                meta, self.tracker, self.source_flag, self.announce_url, str(meta.tracker_status[self.tracker]["status_message"])
+            )
+        finally:
+            log_ptp_timing(meta, "local torrent finalization", started_at)

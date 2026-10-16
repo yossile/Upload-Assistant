@@ -179,8 +179,14 @@ async def _run(args: argparse.Namespace) -> int:
         if args.debug:
             return 0
 
-        await Clients(config=config).add_to_client(meta, "PASSTHEPOPCORN")
         logger.info(tracker_status.get("status_message", "PTP upload completed"))
+        try:
+            await ptp.prepare_for_seeding(meta)
+            await Clients(config=config).add_to_client(meta, "PASSTHEPOPCORN")
+        except Exception as error:
+            tracker_status["post_upload_error"] = str(error)
+            logger.error(f"PTP upload succeeded, but seeding setup failed: {error}")
+            return 1
         return 0
     finally:
         await PassThePopcorn.cancel_prefetch(meta)

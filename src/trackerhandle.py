@@ -341,7 +341,7 @@ async def process_trackers(
                         finally:
                             upload_duration = time.perf_counter() - upload_start_time
                             meta[f"{tracker}_upload_duration"] = upload_duration
-                            log_ptp_timing(meta, "torrent preparation and submission", upload_start_time)
+                            log_ptp_timing(meta, "upload submission and response validation", upload_start_time)
                     except Exception as e:
                         logger.info(f"[red]Upload failed: {escape(str(e))}[/red]")
                         logger.info(traceback.format_exc(), extra={"markup": False})
@@ -349,10 +349,17 @@ async def process_trackers(
                     status = meta.tracker_status.setdefault(ptp.tracker, {})
                     if is_uploaded and "data error" not in str(status.get("status_message", "")):
                         status["upload_success"] = True
-                        client_add_started_at = time.perf_counter()
-                        await client.add_to_client(meta, "PASSTHEPOPCORN")
-                        log_ptp_timing(meta, "add to torrent client", client_add_started_at)
                         print_tracker_result(tracker, ptp, status, True)
+                        try:
+                            await ptp.prepare_for_seeding(meta)
+                            client_add_started_at = time.perf_counter()
+                            try:
+                                await client.add_to_client(meta, "PASSTHEPOPCORN")
+                            finally:
+                                log_ptp_timing(meta, "add to torrent client", client_add_started_at)
+                        except Exception as error:
+                            status["post_upload_error"] = str(error)
+                            logger.warning(f"{tracker}: Upload succeeded, but seeding setup failed: {escape(str(error))}")
                     else:
                         status["upload_success"] = False
                         print_tracker_result(tracker, ptp, status, False)

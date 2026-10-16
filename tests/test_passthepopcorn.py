@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -244,6 +244,81 @@ async def test_form_failure_cancels_torrent_preparation():
 
 
 @pytest.mark.asyncio
+async def test_upload_success_does_not_wait_for_seeding_setup(monkeypatch):
+    import src.trackers.GAZELLE.passthepopcorn as ptp_module
+
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {}
+    tracker.user_agent = "test"
+    tracker.announce_url = "https://please.passthepopcorn.me/test/announce"
+    tracker.cookie_validator = SimpleNamespace(_load_cookies_dict_secure=lambda _path: {})
+    tracker._prepare_upload_torrent = AsyncMock(side_effect=AssertionError("cached torrent must be reused"))
+    tracker._extract_upload_error_message = Mock(side_effect=AssertionError("success page must not be parsed for upload errors"))
+    meta = Meta(base_dir="test", uuid="release", tracker_status={"PASSTHEPOPCORN": {}})
+    tracker._prepared_upload_torrent = ("test/tmp/release/[PASSTHEPOPCORN].torrent", b"torrent")
+    result_url = f"{tracker.base_url}/torrents.php?id=1234&torrentid=5678"
+
+    def handle(request):
+        if request.method == "POST":
+            return httpx.Response(302, headers={"Location": result_url})
+        assert str(request.url) == result_url  # noqa: S101
+        return httpx.Response(200, text="uploaded")
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(handle), **kwargs))
+    monkeypatch.setattr("src.cookie_auth.find_cookie_file", lambda *_args: "unused")
+    rewrite = AsyncMock(side_effect=AssertionError("must run after upload success"))
+    monkeypatch.setattr(ptp_module.Common, "create_torrent_ready_to_seed", rewrite)
+
+    assert await tracker.upload(meta, "https://passthepopcorn.me/upload.php", {}) is True  # noqa: S101
+    assert meta.tracker_status[tracker.tracker]["upload_success"] is True  # noqa: S101
+    assert meta.tracker_status[tracker.tracker]["status_message"] == result_url  # noqa: S101
+    rewrite.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", [None, "rewrite", "client"])
+async def test_ptp_result_precedes_seeding_and_followup_errors_preserve_success(monkeypatch, failure_stage):
+    import src.trackerhandle as handler
+
+    events = []
+    meta = Meta(name="release", trackers=["PASSTHEPOPCORN"], print_tracker_messages=True, tracker_status={"PASSTHEPOPCORN": {"upload": True}})
+    result_url = "https://passthepopcorn.me/torrents.php?id=1234&torrentid=5678"
+
+    async def upload(*_args):
+        meta.tracker_status["PASSTHEPOPCORN"]["status_message"] = result_url
+        events.append("upload")
+        return True
+
+    async def rewrite(*_args):
+        events.append("rewrite")
+        if failure_stage == "rewrite":
+            raise OSError("rewrite failed")
+
+    async def add(*_args):
+        events.append("client")
+        if failure_stage == "client":
+            raise RuntimeError("client failed")
+
+    tracker = SimpleNamespace(tracker="PASSTHEPOPCORN", fill_upload_form=AsyncMock(return_value=("url", {})), upload=upload, prepare_for_seeding=rewrite)
+    monkeypatch.setattr(handler, "PassThePopcorn", lambda **_kwargs: tracker)
+    monkeypatch.setattr(handler, "TrackerSetup", lambda **_kwargs: SimpleNamespace(trackers_enabled=lambda _meta: ["PASSTHEPOPCORN"]))
+    monkeypatch.setattr(handler, "provision_tracker_torrents", AsyncMock())
+    monkeypatch.setattr(handler, "check_tracker_image_hosts", AsyncMock())
+    monkeypatch.setattr(handler, "record_event_async", AsyncMock())
+    monkeypatch.setattr(handler.logger, "info", lambda message, **_kwargs: events.append("result") if result_url in str(message) else None)
+
+    await handler.process_trackers(meta, {"DEFAULT": {"smart_image_host_selection": False}}, SimpleNamespace(add_to_client=add), [], {}, [], [])
+
+    assert events[:3] == ["upload", "result", "rewrite"]  # noqa: S101
+    assert meta.tracker_status["PASSTHEPOPCORN"]["upload_success"] is True  # noqa: S101
+    if failure_stage:
+        assert meta.tracker_status["PASSTHEPOPCORN"]["post_upload_error"] == f"{failure_stage} failed"  # noqa: S101
+    if failure_stage == "rewrite":
+        assert "client" not in events  # noqa: S101
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("group_id, changed_genres, expected_calls", [(None, False, 1), ("1234", False, 0), (None, True, 2)])
 async def test_title_prefetch_skips_existing_groups_and_rejects_changed_tags(monkeypatch, group_id, changed_genres, expected_calls):
     import time
@@ -316,3 +391,24 @@ async def test_unattended_form_prerequisites_overlap_without_mutating_live_host(
 
     assert await asyncio.wait_for(tracker.fill_upload_form(None, meta), timeout=2) == ("url", {})  # noqa: S101
     assert meta.imghost == "imgbb"  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_upload_failure_preserves_error_message_and_response_html(monkeypatch, tmp_path):
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {}
+    tracker.user_agent = "test"
+    tracker.cookie_validator = SimpleNamespace(_load_cookies_dict_secure=lambda _path: {})
+    meta = Meta(base_dir=str(tmp_path), uuid="release", tracker_status={"PASSTHEPOPCORN": {}})
+    release_dir = tmp_path / "tmp" / "release"
+    release_dir.mkdir(parents=True)
+    tracker._prepared_upload_torrent = (str(release_dir / "[PASSTHEPOPCORN].torrent"), b"torrent")
+    html = '<div class="alert--error">Invalid piece size.</div>'
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(lambda _request: httpx.Response(200, text=html)), **kwargs))
+    monkeypatch.setattr("src.cookie_auth.find_cookie_file", lambda *_args: "unused")
+
+    assert await tracker.upload(meta, "https://passthepopcorn.me/upload.php", {}) is False  # noqa: S101
+    assert "Invalid piece size." in meta.tracker_status[tracker.tracker]["status_message"]  # noqa: S101
+    assert not meta.tracker_status[tracker.tracker].get("upload_success")  # noqa: S101
+    assert (release_dir / "[PASSTHEPOPCORN]PTP_upload_failure.html").read_text() == html  # noqa: S101
