@@ -20,6 +20,7 @@ from torf import Torrent
 
 from src.cogs.redaction import Redaction
 from src.console import console, logger
+from src.exceptions import TorrentRemovedError
 from src.meta import Meta
 from src.torrent_clients.path_utils import coerce_str_list, is_path_under, map_save_path, tracker_directory
 from src.torrentcreate import TorrentCreator
@@ -223,7 +224,7 @@ class QbittorrentClientMixin:
                     torrent = next(iter(torrents), None)
 
                 if torrent is None:
-                    raise RuntimeError(f"Torrent {torrent_hash} disappeared from qBittorrent")
+                    raise TorrentRemovedError(f"Torrent {torrent_hash} was removed from qBittorrent; upload cancelled.")
                 torrent_data = cast(dict[str, Any], torrent) if isinstance(torrent, dict) else None
                 state_value = torrent_data.get("state") if torrent_data is not None else getattr(torrent, "state", None)
                 progress_value = torrent_data.get("progress", 0) if torrent_data is not None else getattr(torrent, "progress", 0)

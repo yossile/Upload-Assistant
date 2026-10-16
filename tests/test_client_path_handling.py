@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from qbittorrentapi.torrents import TorrentInfoList
 from torf import Torrent
 
 from src.clients import Clients
+from src.exceptions import TorrentRemovedError
 from src.get_tracker_data import TrackerDataManager
 from src.meta import Meta
 from src.prep_helpers import _imdb_tmdb_prefetch_matches, _tracker_prefetch_matches
@@ -632,6 +634,71 @@ async def test_id_only_prefetch_does_not_claim_skipped_tracker_search_completed(
     await manager.get_tracker_data(None, meta, "Release.mkv", "file", "MOVIE", skip_tracker_descriptions=True, id_only_prefetch=True)
 
     assert meta.tracker_search_attempted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_proxy", [False, True])
+@pytest.mark.parametrize("show_progress", [False, True])
+async def test_qbittorrent_download_removal_cancels_wait(use_proxy, show_progress):
+    clients = Clients({})
+    torrent_hash = "e" * 40
+    responses = [[{"state": "downloading", "progress": 0.5}], []] if show_progress else [[]]
+    client_config = {"qui_proxy_url": "https://qbit.example"} if use_proxy else {}
+    session = AsyncMock()
+    session.get.side_effect = [SimpleNamespace(status_code=200, json=Mock(return_value=response)) for response in responses]
+
+    with (
+        patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=object())),
+        patch.object(clients, "retry_qbt_operation", AsyncMock(side_effect=responses)),
+        patch.object(clients, "create_ssl_context_for_client", return_value=True),
+        patch("src.torrent_clients.qbittorrent.httpx.AsyncClient", return_value=session),
+        patch("src.torrent_clients.qbittorrent.asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(TorrentRemovedError, match=f"Torrent {torrent_hash} was removed from qBittorrent; upload cancelled"),
+    ):
+        await clients._wait_for_qbittorrent_download(client_config, torrent_hash)
+
+    if use_proxy:
+        session.aclose.assert_awaited_once()
+    else:
+        session.aclose.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upload_handles_removed_torrent_without_traceback(tmp_path):
+    import upload
+
+    torrent_hash = "e" * 40
+    message = f"Torrent {torrent_hash} was removed from qBittorrent; upload cancelled."
+    meta = Meta(path=torrent_hash)
+    parser = Mock()
+    parser.parse.return_value = (meta, None, None)
+
+    with (
+        patch.dict(sys.modules, {"data.config": None}),
+        patch.object(sys, "argv", ["upload.py", torrent_hash]),
+        patch.object(upload, "load_heavy_globals"),
+        patch.object(upload, "config", {"DEFAULT": {"sanitize_meta": False}}, create=True),
+        patch.object(upload, "parser", parser, create=True),
+        patch.object(upload, "Meta", Meta, create=True),
+        patch.object(upload, "subprocess_roots", return_value=None),
+        patch.object(upload, "read_paths_from_stdin", return_value=([torrent_hash], [])),
+        patch.object(upload, "update_notification", AsyncMock(return_value=None)),
+        patch("src.stats.configure_stats"),
+        patch("src.configvalidator.validate_config", return_value=(True, [], [])),
+        patch.object(Clients, "resolve_qbittorrent_hash_path", AsyncMock(side_effect=TorrentRemovedError(message))) as resolve_path,
+        patch.object(Clients, "cancel_hash_metadata_prefetch", AsyncMock()) as cancel_prefetch,
+        patch.object(upload.PassThePopcorn, "cancel_prefetch", AsyncMock()) as cancel_ptp_prefetch,
+        patch.object(upload.cleanup_manager, "reset_terminal"),
+        patch.object(upload, "logger") as log,
+        patch.object(upload.traceback, "format_exc") as format_traceback,
+    ):
+        await upload.do_the_thing(str(tmp_path))
+
+    resolve_path.assert_awaited_once_with(meta, torrent_hash)
+    log.info.assert_called_once_with(f"[yellow]{message}[/yellow]")
+    format_traceback.assert_not_called()
+    cancel_prefetch.assert_awaited_once_with(meta)
+    cancel_ptp_prefetch.assert_awaited_once_with(meta)
 
 
 @pytest.mark.asyncio

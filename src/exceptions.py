@@ -44,3 +44,7 @@ class ManualDateError(Exception):
 
 class NoAudioMediaError(Exception):
     pass
+
+
+class TorrentRemovedError(Exception):
+    pass

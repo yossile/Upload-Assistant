@@ -104,6 +104,7 @@ from src.dupe_checking import DupeChecker
 from src.dynamic_hdr_plot import dynamic_hdr_plot_enabled, process_dynamic_hdr_plots
 from src.early_tasks import cancel_and_drain_early_artifact_tasks, get_early_artifact_tasks, release_early_artifact_progress, start_early_artifact_tasks
 from src.early_tasks import is_usenet_only as _is_usenet_only
+from src.exceptions import TorrentRemovedError
 from src.get_desc import gen_desc
 from src.get_name import NameManager
 from src.get_tracker_data import TrackerDataManager
@@ -3088,6 +3089,8 @@ async def do_the_thing(base_dir: str) -> None:
             cleanup_manager.reset_terminal()
         current_release_log_path.set(None)
 
+    except TorrentRemovedError as error:
+        logger.info(f"[yellow]{escape(str(error))}[/yellow]")
     except Exception as e:
         logger.info(f"[bold red]An unexpected error occurred: {escape(str(e))}[/bold red]")
         if sanitize_meta:
