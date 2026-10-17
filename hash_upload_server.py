@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import signal
 import subprocess
@@ -26,9 +27,36 @@ _upload_lock = threading.Lock()
 _active_upload_processes: dict[str, subprocess.Popen[bytes]] = {}
 _submitted_upload_hashes: set[str] = set()
 _tagged_upload_hashes: set[str] = set()
+_completed_upload_hashes: dict[str, str] = {}
 _server_stopping = threading.Event()
 
 app = Flask(__name__)
+
+
+def _collect_completed_uploads() -> None:
+    for torrent_hash, process in list(_active_upload_processes.items()):
+        returncode = process.poll()
+        if returncode is not None:
+            del _active_upload_processes[torrent_hash]
+            if returncode in (10, 11):
+                _completed_upload_hashes[torrent_hash] = "Uploaded" if returncode == 10 else "Cleanup"
+
+
+def _retag_completed_uploads(qbt_client: Client) -> None:
+    with _upload_lock:
+        if _server_stopping.is_set():
+            return
+        _collect_completed_uploads()
+        for torrent_hash, tag in sorted(_completed_upload_hashes.items()):
+            try:
+                qbt_client.torrents_add_tags(torrent_hashes=torrent_hash, tags=tag)
+                qbt_client.torrents_remove_tags(torrent_hashes=torrent_hash, tags="Upload")
+            except Exception:
+                app.logger.warning("Could not update tags for completed torrent %s; will retry", torrent_hash)
+                continue
+            _completed_upload_hashes.pop(torrent_hash, None)
+            _tagged_upload_hashes.add(torrent_hash)
+            app.logger.info("Replaced Upload tag with %s for %s", tag, torrent_hash)
 
 
 def _stop_upload_process(process: subprocess.Popen[bytes]) -> None:
@@ -50,9 +78,7 @@ def _toggle_upload_process(
             return None, "stopping"
         if not cancel_running and upload_key in _submitted_upload_hashes:
             return None, "submitted"
-        for key, process in list(_active_upload_processes.items()):
-            if process.poll() is not None:
-                del _active_upload_processes[key]
+        _collect_completed_uploads()
 
         process = _active_upload_processes.get(upload_key)
         if process is not None:
@@ -64,7 +90,8 @@ def _toggle_upload_process(
 
         if not ALLOW_CONCURRENT_UPLOADS and _active_upload_processes:
             return None, "busy"
-        process = subprocess.Popen(command, cwd=PROJECT_ROOT)
+        process = subprocess.Popen(command, cwd=PROJECT_ROOT, env={**os.environ, "UA_REPORT_UPLOAD_SUCCESS": "1"})
+        _completed_upload_hashes.pop(upload_key, None)
         _active_upload_processes[upload_key] = process
         _submitted_upload_hashes.add(upload_key)
         return process, "started"
@@ -86,6 +113,7 @@ def _shutdown_uploads() -> None:
                 del _active_upload_processes[torrent_hash]
             except OSError:
                 app.logger.exception("Could not stop upload %s during shutdown", torrent_hash)
+        _completed_upload_hashes.clear()
 
 
 def _handle_shutdown(_signum: int, _frame: object) -> None:
@@ -107,6 +135,7 @@ def _confirm_existing_tagged(torrents: dict[str, Any], policy: str) -> bool:
 
 
 def _poll_upload_tag(qbt_client: Client, *, existing_tagged: str | None = None) -> None:
+    _retag_completed_uploads(qbt_client)
     torrents = {
         torrent.hash.lower(): torrent
         for torrent in qbt_client.torrents_info(tag="Upload")
@@ -140,7 +169,7 @@ def _poll_upload_tag(qbt_client: Client, *, existing_tagged: str | None = None) 
             app.logger.info("Started upload for tagged torrent %s", torrent_hash)
 
 
-async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask") -> None:
+async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask", watch_tags: bool = True) -> None:
     from src.clients import Clients
 
     config = cast(dict[str, Any], import_module("data.config").config)
@@ -150,7 +179,8 @@ async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_
         app.logger.warning("Upload tag watcher disabled: default torrent client is not qBittorrent")
         return
 
-    print(f"Watching qBittorrent client '{client_name}' for tag 'Upload' (polling every {poll_interval}s).", flush=True)
+    if watch_tags:
+        print(f"Watching qBittorrent client '{client_name}' for tag 'Upload' (polling every {poll_interval}s).", flush=True)
     clients = Clients(config)
     qbt_client = None
     startup_pending = True
@@ -159,16 +189,19 @@ async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_
             if qbt_client is None:
                 qbt_client = await clients.init_qbittorrent_client(client_config)
             if qbt_client is not None and not stop.is_set():
-                _poll_upload_tag(qbt_client, existing_tagged=existing_tagged if startup_pending else None)
-                startup_pending = False
+                if watch_tags:
+                    _poll_upload_tag(qbt_client, existing_tagged=existing_tagged if startup_pending else None)
+                    startup_pending = False
+                else:
+                    _retag_completed_uploads(qbt_client)
         except Exception:
             app.logger.warning("Could not poll qBittorrent Upload tag; will retry")
         stop.wait(poll_interval)
 
 
-def _run_tag_watcher(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask") -> None:
+def _run_tag_watcher(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask", watch_tags: bool = True) -> None:
     try:
-        asyncio.run(_watch_upload_tag(stop, poll_interval, existing_tagged))
+        asyncio.run(_watch_upload_tag(stop, poll_interval, existing_tagged, watch_tags))
     except Exception:
         app.logger.warning("Upload tag watcher could not initialize")
 
@@ -216,9 +249,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.watch_only:
             _run_tag_watcher(stop, args.poll_interval, args.existing_tagged)
         else:
-            if not args.no_tag_watch:
-                watcher = threading.Thread(target=_run_tag_watcher, args=(stop, args.poll_interval, args.existing_tagged), daemon=True)
-                watcher.start()
+            watcher_args = (stop, args.poll_interval, args.existing_tagged) if not args.no_tag_watch else (stop, args.poll_interval, args.existing_tagged, False)
+            watcher = threading.Thread(target=_run_tag_watcher, args=watcher_args, daemon=True)
+            watcher.start()
             app.run(host=args.host, port=args.port)
     except KeyboardInterrupt:
         pass

@@ -156,6 +156,8 @@ class WebUIServer(Protocol):
 
 # Global state for shutdown handling (reset via _reset_shutdown_state() for in-process runs)
 _shutdown_requested = False
+_upload_succeeded = False
+_upload_dupe = False
 _is_webui_mode = False
 _webui_server: WebUIServer | None = None  # Reference to waitress server for graceful shutdown
 _shutdown_event = threading.Event()  # Event for coordinating graceful shutdown
@@ -165,8 +167,10 @@ _webui_run_token: str | None = None
 
 def _reset_shutdown_state() -> None:
     """Reset global shutdown state for clean in-process runs from web UI."""
-    global _shutdown_requested, _is_webui_mode, _webui_server, _webui_session_id, _webui_run_token
+    global _shutdown_requested, _upload_succeeded, _upload_dupe, _is_webui_mode, _webui_server, _webui_session_id, _webui_run_token
     _shutdown_requested = False
+    _upload_succeeded = False
+    _upload_dupe = False
     _is_webui_mode = False
     _webui_server = None
     _webui_session_id = None
@@ -2213,6 +2217,7 @@ def load_heavy_globals() -> None:
 
 
 async def do_the_thing(base_dir: str) -> None:
+    global _upload_succeeded, _upload_dupe
     webui_roots = subprocess_roots()
     if webui_roots is not None:
         validate_argument_paths(sys.argv[2:], webui_roots)
@@ -3053,6 +3058,10 @@ async def do_the_thing(base_dir: str) -> None:
             # Hooks may inspect the final tracker status and files have not yet been cleaned.
             await record_completed_item_stats_async(meta, tracker_class_map)
             await write_meta_file(meta)
+            _upload_succeeded |= not meta.debug and any(
+                status.get("upload_success") is True for status in (meta.tracker_status or {}).values()
+            )
+            _upload_dupe |= not meta.debug and any(status.get("dupe") is True for status in (meta.tracker_status or {}).values())
             _publish_webui_preview_target(cast(str, meta.path or ""), meta.uuid or None)
             await run_post_upload_hooks(meta, config)
 
@@ -3403,7 +3412,8 @@ def run() -> None:
                         stream.flush()
                 os._exit(0)
 
-        sys.exit(0)
+        exit_code = 10 if _upload_succeeded else 11 if _upload_dupe else 0
+        sys.exit(exit_code if not _shutdown_requested and os.environ.get("UA_REPORT_UPLOAD_SUCCESS") == "1" else 0)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ CHILD = textwrap.dedent("""\
     import threading
     from types import SimpleNamespace
 
+    sys.modules['data.config'] = SimpleNamespace(config={'DEFAULT': {}})
     import upload
     from src.console import prompt_in_thread
 
@@ -51,7 +52,11 @@ CHILD = textwrap.dedent("""\
 
     async def main():
         upload._reset_shutdown_state()
-        if mode in ('normal', 'normal-verbose'):
+        if mode in ('normal', 'normal-verbose', 'uploaded', 'uploaded-cancelled', 'dupe', 'dupe-cancelled', 'uploaded-dupe'):
+            upload._upload_succeeded = mode.startswith('uploaded')
+            upload._upload_dupe = 'dupe' in mode
+            if mode.endswith('cancelled'):
+                signal.raise_signal(signum)
             if mode == 'normal-verbose':
                 print('x' * 1_000_000, flush=True)
             print(await asyncio.to_thread(lambda: 'NORMAL_DONE'), flush=True)
@@ -144,6 +149,18 @@ def test_normal_run_preserves_interpreter_cleanup(mode: str) -> None:
 
     assert code == 0, output
     assert "NORMAL_DONE" in output
+    assert "CLEANUP_DONE" in output
+    assert "ATEXIT" in output
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mode", ["normal", "uploaded", "uploaded-cancelled", "dupe", "dupe-cancelled", "uploaded-dupe"])
+def test_run_reports_outcome_only_when_enabled_and_not_cancelled(monkeypatch, enabled, mode):
+    monkeypatch.setenv("UA_REPORT_UPLOAD_SUCCESS", "1" if enabled else "0")
+
+    code, output = run_child(mode)
+
+    assert code == ({"uploaded": 10, "dupe": 11, "uploaded-dupe": 10}.get(mode, 0) if enabled else 0), output
     assert "CLEANUP_DONE" in output
     assert "ATEXIT" in output
 

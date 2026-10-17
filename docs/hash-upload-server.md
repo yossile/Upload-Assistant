@@ -19,6 +19,7 @@ The server also polls the configured `DEFAULT.default_torrent_client` every five
 The `Upload` tag controls the upload lifecycle:
 
 - Adding it starts an upload on the next successful poll.
+- Once UA exits after at least one confirmed tracker upload, the server adds `Uploaded` and removes `Upload`. Other tags are preserved. Failed tag changes are retried on subsequent polls.
 - Leaving it in place does not repeat a finished, failed, or manually cancelled upload.
 - Removing it cancels an active upload, using the same terminate/kill behavior as the HTTP endpoint. Removing it after completion does not start another upload.
 - Removing and re-adding it allows a fresh upload. Both changes must be observed by separate polls.
@@ -32,9 +33,11 @@ python hash_upload_server.py --existing-tagged start
 python hash_upload_server.py --existing-tagged skip
 ```
 
-Tags are left unchanged and serve as the restart state; no separate history file is written. Restarting clears in-memory tracking and asks again about existing tags. Consequently, starting existing tags can resubmit previously completed uploads as well as interrupted ones. Normal shutdown, Ctrl+C, and `SIGTERM` stop tracked uploads. `SIGKILL`, crashes, and power loss cannot run cleanup; killing only the server process does not guarantee its children stop, so ensure old uploads have stopped before starting existing tags again.
+Only server children opt in via `UA_REPORT_UPLOAD_SUCCESS=1`: exit code `10` means a successful upload (`Uploaded`), while `11` means a confirmed dupe without a successful upload (`Cleanup`). Both replace `Upload`, preserving other tags and retrying failed tag changes. Normal CLI exits are unchanged. Skips, debug runs, cancellations, and other failures leave tags unchanged.
 
-Change the polling interval with `--poll-interval`, or disable the watcher with `--no-tag-watch`:
+Tags serve as the restart state; no separate history file is written. Restarting clears in-memory tracking and asks again about existing `Upload` tags. Consequently, starting existing tags can resubmit uploads whose completion was not retagged before shutdown, as well as interrupted ones. Normal shutdown, Ctrl+C, and `SIGTERM` stop tracked uploads. `SIGKILL`, crashes, and power loss cannot run cleanup; killing only the server process does not guarantee its children stop, so ensure old uploads have stopped before starting existing tags again.
+
+Change the polling interval with `--poll-interval`, or disable automatic tag-based submissions and cancellations with `--no-tag-watch`. Completion retagging for HTTP-started uploads remains enabled:
 
 ```bash
 python hash_upload_server.py --poll-interval 10

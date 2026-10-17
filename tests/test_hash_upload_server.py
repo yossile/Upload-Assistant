@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
@@ -15,6 +15,7 @@ def reset_upload_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_active_upload_processes", {})
     monkeypatch.setattr(server, "_submitted_upload_hashes", set())
     monkeypatch.setattr(server, "_tagged_upload_hashes", set())
+    monkeypatch.setattr(server, "_completed_upload_hashes", {})
     monkeypatch.setattr(server, "_server_stopping", server.threading.Event())
 
 
@@ -207,7 +208,8 @@ def test_hash_endpoint_runs_upload_with_positional_hash_and_unattended(monkeypat
 
     assert response.status_code == 202
     assert response.json == {"success": True, "status": "started", "hash": torrent_hash, "pid": 1234}
-    assert calls == [([server.sys.executable, str(server.UPLOAD_SCRIPT), torrent_hash, "--unattended"], {"cwd": server.PROJECT_ROOT})]
+    assert calls == [([server.sys.executable, str(server.UPLOAD_SCRIPT), torrent_hash, "--unattended"], {"cwd": server.PROJECT_ROOT, "env": ANY})]
+    assert calls[0][1]["env"]["UA_REPORT_UPLOAD_SUCCESS"] == "1"
     assert "--torrenthash" not in calls[0][0]
 
 
@@ -334,8 +336,79 @@ def test_tag_poll_starts_each_hash_only_once(monkeypatch: pytest.MonkeyPatch) ->
     server._poll_upload_tag(qbt_client)
 
     qbt_client.torrents_info.assert_called_with(tag="Upload")
-    popen.assert_called_once_with(server._upload_command(torrent_hash), cwd=server.PROJECT_ROOT)
+    popen.assert_called_once_with(server._upload_command(torrent_hash), cwd=server.PROJECT_ROOT, env=ANY)
     process.terminate.assert_not_called()
+
+
+@pytest.mark.parametrize("returncode", [None, 0, 1, -15, 10, 11])
+def test_only_success_or_dupe_exit_replaces_upload_tag(monkeypatch: pytest.MonkeyPatch, returncode):
+    torrent_hash = "a" * 40
+    tags = {"Upload", "Keep"}
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    client = Mock()
+    client.torrents_info.side_effect = lambda **_kwargs: [SimpleNamespace(hash=torrent_hash)] if "Upload" in tags else []
+    client.torrents_add_tags.side_effect = lambda **kwargs: tags.add(kwargs["tags"])
+    client.torrents_remove_tags.side_effect = lambda **kwargs: tags.discard(kwargs["tags"])
+
+    server._poll_upload_tag(client)
+    process.poll.return_value = returncode
+    server._poll_upload_tag(client)
+    server._poll_upload_tag(client)
+
+    assert tags == {{10: "Uploaded", 11: "Cleanup"}.get(returncode, "Upload"), "Keep"}
+    popen.assert_called_once()
+    process.terminate.assert_not_called()
+    assert client.torrents_add_tags.call_count == (returncode in (10, 11))
+    assert client.torrents_remove_tags.call_count == (returncode in (10, 11))
+
+
+@pytest.mark.parametrize("failed_method", ["torrents_add_tags", "torrents_remove_tags"])
+@pytest.mark.parametrize(("returncode", "tag"), [(10, "Uploaded"), (11, "Cleanup")])
+def test_retag_failure_is_retried(failed_method, returncode, tag):
+    torrent_hash = "a" * 40
+    process = Mock(pid=1234)
+    process.poll.return_value = returncode
+    server._active_upload_processes[torrent_hash] = process
+    client = Mock()
+    getattr(client, failed_method).side_effect = [RuntimeError("offline"), None]
+    server._retag_completed_uploads(client)
+
+    assert server._completed_upload_hashes == {torrent_hash: tag}
+    assert not server._active_upload_processes
+    if failed_method == "torrents_add_tags":
+        client.torrents_remove_tags.assert_not_called()
+
+    server._retag_completed_uploads(client)
+
+    assert not server._completed_upload_hashes
+    assert getattr(client, failed_method).call_count == 2
+    assert client.method_calls[-2:] == [
+        ("torrents_add_tags", (), {"torrent_hashes": torrent_hash, "tags": tag}),
+        ("torrents_remove_tags", (), {"torrent_hashes": torrent_hash, "tags": "Upload"}),
+    ]
+
+
+def test_completion_polling_without_tag_watch(monkeypatch: pytest.MonkeyPatch):
+    client_config = {"torrent_client": "qbit"}
+    config: dict[str, object] = {"DEFAULT": {"default_torrent_client": "source"}, "TORRENT_CLIENTS": {"source": client_config}}
+    client = Mock()
+    clients = Mock(init_qbittorrent_client=AsyncMock(return_value=client))
+    monkeypatch.setitem(server.sys.modules, "data.config", SimpleNamespace(config=config))
+    monkeypatch.setitem(server.sys.modules, "src.clients", SimpleNamespace(Clients=Mock(return_value=clients)))
+    process = Mock(pid=1234)
+    process.poll.return_value = 10
+    server._active_upload_processes["a" * 40] = process
+    stop = server.threading.Event()
+    monkeypatch.setattr(stop, "wait", lambda _interval: stop.set())
+
+    server.asyncio.run(server._watch_upload_tag(stop, 5, watch_tags=False))
+
+    client.torrents_info.assert_not_called()
+    client.torrents_add_tags.assert_called_once_with(torrent_hashes="a" * 40, tags="Uploaded")
+    client.torrents_remove_tags.assert_called_once_with(torrent_hashes="a" * 40, tags="Upload")
 
 
 def test_tag_poll_does_not_repeat_http_submission(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -671,4 +744,4 @@ def test_startup_confirmation_survives_connection_and_query_failures(monkeypatch
 
     assert clients.init_qbittorrent_client.await_count == 2
     confirm.assert_called_once_with({"a" * 40: old}, "ask")
-    popen.assert_called_once_with(server._upload_command("b" * 40), cwd=server.PROJECT_ROOT)
+    popen.assert_called_once_with(server._upload_command("b" * 40), cwd=server.PROJECT_ROOT, env=ANY)
