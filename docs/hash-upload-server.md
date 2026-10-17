@@ -6,6 +6,35 @@ Run the standalone server from the repository root. The default bind address is 
 python hash_upload_server.py --port 8765
 ```
 
+The server also polls the configured `DEFAULT.default_torrent_client` every five seconds for torrents tagged exactly `Upload`. The default client must be a qBittorrent (`qbit`) client. Queries are filtered by tag on qBittorrent, rather than fetching all torrents. Each matching hash starts the same unattended upload as an HTTP request, without debug mode.
+
+The `Upload` tag controls the upload lifecycle:
+
+- Adding it starts an upload on the next successful poll.
+- Leaving it in place does not repeat a finished, failed, or manually cancelled upload.
+- Removing it cancels an active upload, using the same terminate/kill behavior as the HTTP endpoint. Removing it after completion does not start another upload.
+- Removing and re-adding it allows a fresh upload. Both changes must be observed by separate polls.
+
+Only successful polls update tag membership; a connection failure never counts as tag removal. Failed process starts, failed cancellations, and torrents blocked by single-upload mode are retried on subsequent polls. Removing a torrent from qBittorrent also removes it from the tagged results and cancels its active upload. HTTP-only uploads whose tags have never been observed are not affected.
+
+On the first successful poll after startup, the server lists existing tagged torrents and asks whether to start them. The default answer is **no**. Declined hashes stay ignored until their tags are removed and re-added; newly tagged torrents are still processed automatically. Without an interactive terminal, existing tags are skipped unless explicitly enabled:
+
+```bash
+python hash_upload_server.py --existing-tagged start
+python hash_upload_server.py --existing-tagged skip
+```
+
+Tags are left unchanged and serve as the restart state; no separate history file is written. Restarting clears in-memory tracking and asks again about existing tags. Consequently, starting existing tags can resubmit previously completed uploads as well as interrupted ones. Normal shutdown, Ctrl+C, and `SIGTERM` stop tracked uploads. `SIGKILL`, crashes, and power loss cannot run cleanup; killing only the server process does not guarantee its children stop, so ensure old uploads have stopped before starting existing tags again.
+
+Change the polling interval with `--poll-interval`, or disable the watcher with `--no-tag-watch`:
+
+```bash
+python hash_upload_server.py --poll-interval 10
+python hash_upload_server.py --no-tag-watch
+```
+
+If the default client is not qBittorrent or watcher initialization fails, HTTP uploads remain available. Temporary polling failures are retried on the next interval.
+
 Choose a different bind address with `--host`, for example `0.0.0.0` to listen on all interfaces:
 
 ```bash

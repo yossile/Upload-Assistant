@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,6 +13,9 @@ import hash_upload_server as server
 @pytest.fixture(autouse=True)
 def reset_upload_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_active_upload_processes", {})
+    monkeypatch.setattr(server, "_submitted_upload_hashes", set())
+    monkeypatch.setattr(server, "_tagged_upload_hashes", set())
+    monkeypatch.setattr(server, "_server_stopping", server.threading.Event())
 
 
 @pytest.mark.parametrize("allow_concurrent", [True, False])
@@ -145,7 +148,7 @@ def test_main_passes_host_and_port_to_server(monkeypatch: pytest.MonkeyPatch) ->
     run_args = []
     monkeypatch.setattr(server.app, "run", lambda **kwargs: run_args.append(kwargs))
 
-    assert server.main(["--host", "0.0.0.0", "--port", "9000"]) == 0
+    assert server.main(["--host", "0.0.0.0", "--port", "9000", "--no-tag-watch"]) == 0
 
     assert run_args == [{"host": "0.0.0.0", "port": 9000}]
 
@@ -273,3 +276,358 @@ def test_single_upload_mode_accepts_new_request_after_previous_process_exits(mon
 
     assert first_response.status_code == 202
     assert second_response.status_code == 202
+
+
+def test_tag_poll_starts_each_hash_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    torrent_hash = "a" * 40
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash=torrent_hash)]
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+    process.poll.return_value = 0
+    server._poll_upload_tag(qbt_client)
+
+    qbt_client.torrents_info.assert_called_with(tag="Upload")
+    popen.assert_called_once_with(server._upload_command(torrent_hash), cwd=server.PROJECT_ROOT)
+    process.terminate.assert_not_called()
+
+
+def test_tag_poll_does_not_repeat_http_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = 0
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    assert server.app.test_client().get(f"/upload?hash={'A' * 40}").status_code == 202
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40)]
+
+    server._poll_upload_tag(qbt_client)
+
+    popen.assert_called_once()
+
+
+def test_tag_poll_retries_busy_torrents(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "ALLOW_CONCURRENT_UPLOADS", False)
+    first = Mock(pid=1234)
+    first.poll.return_value = None
+    second = Mock(pid=5678)
+    second.poll.return_value = None
+    popen = Mock(side_effect=[first, second])
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40), SimpleNamespace(hash="b" * 40)]
+
+    server._poll_upload_tag(qbt_client)
+    assert server._submitted_upload_hashes == {"a" * 40}
+    first.poll.return_value = 0
+    server._poll_upload_tag(qbt_client)
+
+    assert popen.call_count == 2
+    assert server._submitted_upload_hashes == {"a" * 40, "b" * 40}
+
+
+def test_tag_poll_retries_spawn_failures_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(side_effect=[OSError("spawn failed"), process, process])
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40), SimpleNamespace(hash="b" * 40)]
+
+    server._poll_upload_tag(qbt_client)
+    assert server._submitted_upload_hashes == {"b" * 40}
+    server._poll_upload_tag(qbt_client)
+
+    assert popen.call_count == 3
+    assert server._submitted_upload_hashes == {"a" * 40, "b" * 40}
+
+
+def test_tag_poll_picks_up_new_hashes_and_skips_invalid_hashes(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [
+        [SimpleNamespace(hash="a" * 40)],
+        [SimpleNamespace(hash="a" * 40), SimpleNamespace(hash="b" * 64), SimpleNamespace(hash="invalid")],
+    ]
+
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+
+    assert [call.args[0][2] for call in popen.call_args_list] == ["a" * 40, "b" * 64]
+
+
+def test_main_starts_five_second_watcher_and_stops_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    thread = Mock()
+    thread_factory = Mock(return_value=thread)
+    monkeypatch.setattr(server.threading, "Thread", thread_factory)
+    monkeypatch.setattr(server.app, "run", Mock())
+
+    assert server.main([]) == 0
+
+    kwargs = thread_factory.call_args.kwargs
+    assert kwargs["target"] is server._run_tag_watcher
+    assert kwargs["args"][1] == 5
+    assert kwargs["args"][0].is_set()
+    assert kwargs["daemon"] is True
+    thread.start.assert_called_once_with()
+    thread.join.assert_called_once_with(timeout=5)
+
+
+@pytest.mark.parametrize("interval", ["0", "-1"])
+def test_main_rejects_nonpositive_poll_interval(monkeypatch: pytest.MonkeyPatch, interval: str) -> None:
+    run = Mock()
+    monkeypatch.setattr(server.app, "run", run)
+
+    with pytest.raises(SystemExit) as error:
+        server.main(["--poll-interval", interval])
+
+    assert error.value.code == 2
+    run.assert_not_called()
+
+
+def test_watcher_uses_default_client_and_recovers_from_poll_failure(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    client_config = {"torrent_client": "qbit"}
+    config = {
+        "DEFAULT": {"default_torrent_client": "default-qbit", "searching_client_list": ["other"]},
+        "TORRENT_CLIENTS": {"default-qbit": client_config, "other": {"torrent_client": "deluge"}},
+    }
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [RuntimeError("unavailable"), []]
+    clients = Mock(init_qbittorrent_client=AsyncMock(return_value=qbt_client))
+    clients_factory = Mock(return_value=clients)
+    monkeypatch.setitem(server.sys.modules, "data.config", SimpleNamespace(config=config))
+    monkeypatch.setitem(server.sys.modules, "src.clients", SimpleNamespace(Clients=clients_factory))
+    waits = []
+    stop = SimpleNamespace(is_set=lambda: len(waits) >= 2, wait=waits.append)
+
+    server.asyncio.run(server._watch_upload_tag(stop, 5))
+
+    clients_factory.assert_called_once_with(config)
+    clients.init_qbittorrent_client.assert_awaited_once_with(client_config)
+    assert qbt_client.torrents_info.call_count == 2
+    assert waits == [5, 5]
+    assert capsys.readouterr().out == "Watching qBittorrent client 'default-qbit' for tag 'Upload' (polling every 5s).\n"
+
+
+def test_watcher_skips_non_qbittorrent_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = {
+        "DEFAULT": {"default_torrent_client": "other"},
+        "TORRENT_CLIENTS": {"other": {"torrent_client": "deluge"}},
+    }
+    clients_factory = Mock()
+    monkeypatch.setitem(server.sys.modules, "data.config", SimpleNamespace(config=config))
+    monkeypatch.setitem(server.sys.modules, "src.clients", SimpleNamespace(Clients=clients_factory))
+
+    server.asyncio.run(server._watch_upload_tag(server.threading.Event(), 5))
+
+    clients_factory.assert_not_called()
+
+
+def test_removing_tag_cancels_and_retagging_restarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    torrent = SimpleNamespace(hash="A" * 40)
+    qbt_client.torrents_info.side_effect = [[torrent], [], [], [torrent]]
+
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+    assert not server._active_upload_processes
+    assert not server._submitted_upload_hashes
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=5)
+    server._poll_upload_tag(qbt_client)
+    assert popen.call_count == 1
+    server._poll_upload_tag(qbt_client)
+    assert popen.call_count == 2
+
+
+def test_removing_completed_torrent_tag_does_not_restart_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = 0
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [[SimpleNamespace(hash="a" * 40)], []]
+
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+
+    popen.assert_called_once()
+    process.terminate.assert_not_called()
+    assert not server._submitted_upload_hashes
+
+
+def test_failed_poll_does_not_cancel_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [[SimpleNamespace(hash="a" * 40)], RuntimeError("offline")]
+
+    server._poll_upload_tag(qbt_client)
+    with pytest.raises(RuntimeError, match="offline"):
+        server._poll_upload_tag(qbt_client)
+
+    process.terminate.assert_not_called()
+    assert server._tagged_upload_hashes == {"a" * 40}
+
+
+@pytest.mark.parametrize("answer", ["y", "YES", "n", ""])
+def test_startup_confirmation_lists_existing_torrents(monkeypatch: pytest.MonkeyPatch, answer: str) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    monkeypatch.setattr(server.sys.stdin, "isatty", lambda: True)
+    prompt = Mock(return_value=answer)
+    monkeypatch.setattr("builtins.input", prompt)
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40, name="Existing release")]
+
+    server._poll_upload_tag(qbt_client, existing_tagged="ask")
+    server._poll_upload_tag(qbt_client)
+
+    assert popen.call_count == int(answer.lower() in {"y", "yes"})
+    prompt.assert_called_once()
+    assert "Existing release" in prompt.call_args.args[0]
+    assert "a" * 40 in prompt.call_args.args[0]
+
+
+def test_skipped_startup_tags_allow_new_tags_and_retagging(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    old = SimpleNamespace(hash="a" * 40)
+    new = SimpleNamespace(hash="b" * 40)
+    qbt_client.torrents_info.side_effect = [[old], [old, new], [new], [old, new]]
+
+    server._poll_upload_tag(qbt_client, existing_tagged="skip")
+    popen.assert_not_called()
+    server._poll_upload_tag(qbt_client)
+    assert popen.call_count == 1
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+    assert popen.call_count == 2
+
+
+def test_startup_without_terminal_skips_existing_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server.sys.stdin, "isatty", lambda: False)
+    popen = Mock()
+    prompt = Mock()
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    monkeypatch.setattr("builtins.input", prompt)
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40)]
+
+    server._poll_upload_tag(qbt_client, existing_tagged="ask")
+
+    popen.assert_not_called()
+    prompt.assert_not_called()
+
+
+def test_failed_tag_cancellation_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    process.terminate.side_effect = [OSError("permission denied"), None]
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [[SimpleNamespace(hash="a" * 40)], [], []]
+
+    server._poll_upload_tag(qbt_client)
+    server._poll_upload_tag(qbt_client)
+    assert server._tagged_upload_hashes == {"a" * 40}
+    assert server._active_upload_processes["a" * 40] is process
+    server._poll_upload_tag(qbt_client)
+
+    assert not server._tagged_upload_hashes
+    assert not server._active_upload_processes
+    assert not server._submitted_upload_hashes
+    assert process.terminate.call_count == 2
+    popen.assert_called_once()
+
+
+def test_normal_shutdown_stops_active_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    server._active_upload_processes["a" * 40] = process
+    monkeypatch.setattr(server.app, "run", Mock())
+    previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
+
+    assert server.main(["--no-tag-watch"]) == 0
+
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=5)
+    assert not server._active_upload_processes
+    assert server._server_stopping.is_set()
+    assert server.signal.getsignal(server.signal.SIGTERM) == previous_sigterm
+
+
+def test_sigterm_stops_uploads_and_restores_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    server._active_upload_processes["a" * 40] = process
+    previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
+
+    def run(**_kwargs):
+        server.signal.getsignal(server.signal.SIGTERM)(server.signal.SIGTERM, None)
+
+    monkeypatch.setattr(server.app, "run", run)
+    with pytest.raises(SystemExit) as error:
+        server.main(["--no-tag-watch"])
+
+    assert error.value.code == 0
+    process.terminate.assert_called_once_with()
+    assert not server._active_upload_processes
+    assert server.signal.getsignal(server.signal.SIGTERM) == previous_sigterm
+
+
+def test_shutdown_prevents_new_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
+    popen = Mock()
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    server._server_stopping.set()
+
+    process, status = server._toggle_upload_process(server._upload_command("a" * 40), "a" * 40)
+
+    assert process is None
+    assert status == "stopping"
+    popen.assert_not_called()
+
+
+def test_startup_confirmation_survives_connection_and_query_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_config = {"torrent_client": "qbit"}
+    config = {"DEFAULT": {"default_torrent_client": "qbit"}, "TORRENT_CLIENTS": {"qbit": client_config}}
+    old = SimpleNamespace(hash="a" * 40, name="Existing release")
+    new = SimpleNamespace(hash="b" * 40, name="New release")
+    qbt_client = Mock()
+    qbt_client.torrents_info.side_effect = [RuntimeError("offline"), [old], [old, new]]
+    clients = Mock(init_qbittorrent_client=AsyncMock(side_effect=[None, qbt_client]))
+    monkeypatch.setitem(server.sys.modules, "data.config", SimpleNamespace(config=config))
+    monkeypatch.setitem(server.sys.modules, "src.clients", SimpleNamespace(Clients=Mock(return_value=clients)))
+    confirm = Mock(return_value=False)
+    monkeypatch.setattr(server, "_confirm_existing_tagged", confirm)
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    waits = []
+    stop = SimpleNamespace(is_set=lambda: len(waits) >= 4, wait=waits.append)
+
+    server.asyncio.run(server._watch_upload_tag(stop, 5))
+
+    assert clients.init_qbittorrent_client.await_count == 2
+    confirm.assert_called_once_with({"a" * 40: old}, "ask")
+    popen.assert_called_once_with(server._upload_command("b" * 40), cwd=server.PROJECT_ROOT)
