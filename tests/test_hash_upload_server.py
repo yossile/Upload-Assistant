@@ -153,6 +153,47 @@ def test_main_passes_host_and_port_to_server(monkeypatch: pytest.MonkeyPatch) ->
     assert run_args == [{"host": "0.0.0.0", "port": 9000}]
 
 
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_watch_only_runs_without_http_and_cleans_up(monkeypatch: pytest.MonkeyPatch, interrupt: bool) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    server._active_upload_processes["a" * 40] = process
+    watch = Mock(side_effect=KeyboardInterrupt if interrupt else None)
+    run = Mock()
+    thread_factory = Mock()
+    monkeypatch.setattr(server, "_run_tag_watcher", watch)
+    monkeypatch.setattr(server.app, "run", run)
+    monkeypatch.setattr(server.threading, "Thread", thread_factory)
+    previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
+
+    assert server.main(["--watch-only", "--poll-interval", "10", "--existing-tagged", "skip"]) == 0
+
+    watch.assert_called_once()
+    stop, interval, policy = watch.call_args.args
+    assert stop.is_set()
+    assert interval == 10
+    assert policy == "skip"
+    run.assert_not_called()
+    thread_factory.assert_not_called()
+    process.terminate.assert_called_once_with()
+    assert not server._active_upload_processes
+    assert server.signal.getsignal(server.signal.SIGTERM) == previous_sigterm
+
+
+def test_watch_only_rejects_disabled_tag_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Mock()
+    watch = Mock()
+    monkeypatch.setattr(server.app, "run", run)
+    monkeypatch.setattr(server, "_run_tag_watcher", watch)
+
+    with pytest.raises(SystemExit) as error:
+        server.main(["--watch-only", "--no-tag-watch"])
+
+    assert error.value.code == 2
+    run.assert_not_called()
+    watch.assert_not_called()
+
+
 def test_hash_endpoint_runs_upload_with_positional_hash_and_unattended(monkeypatch: pytest.MonkeyPatch) -> None:
     torrent_hash = "a" * 40
     calls = []

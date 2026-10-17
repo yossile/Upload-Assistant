@@ -6,6 +6,14 @@ Run the standalone server from the repository root. The default bind address is 
 python hash_upload_server.py --port 8765
 ```
 
+To only watch qBittorrent tags without opening an HTTP listener, use `--watch-only`:
+
+```bash
+python hash_upload_server.py --watch-only
+```
+
+Startup confirmation, tag-removal cancellation, and shutdown cleanup work in this mode too. It supports `--poll-interval` and `--existing-tagged`, but cannot be combined with `--no-tag-watch`. The `--host` and `--port` settings have no effect in this mode.
+
 The server also polls the configured `DEFAULT.default_torrent_client` every five seconds for torrents tagged exactly `Upload`. The default client must be a qBittorrent (`qbit`) client. Queries are filtered by tag on qBittorrent, rather than fetching all torrents. Each matching hash starts the same unattended upload as an HTTP request, without debug mode.
 
 The `Upload` tag controls the upload lifecycle:

@@ -170,7 +170,7 @@ def _run_tag_watcher(stop: threading.Event, poll_interval: int, existing_tagged:
     try:
         asyncio.run(_watch_upload_tag(stop, poll_interval, existing_tagged))
     except Exception:
-        app.logger.warning("Upload tag watcher could not initialize; HTTP uploads remain available")
+        app.logger.warning("Upload tag watcher could not initialize")
 
 
 @app.get("/upload")
@@ -197,11 +197,13 @@ def upload_hash():
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Upload a qBittorrent torrent by hash over HTTP.")
+    parser = argparse.ArgumentParser(description="Upload qBittorrent torrents by hash over HTTP or by watching tags.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     parser.add_argument("--poll-interval", type=int, default=5, help="Seconds between Upload tag checks (default: 5)")
-    parser.add_argument("--no-tag-watch", action="store_true", help="Disable polling the default qBittorrent client for the Upload tag")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-tag-watch", action="store_true", help="Disable polling the default qBittorrent client for the Upload tag")
+    mode.add_argument("--watch-only", action="store_true", help="Watch Upload tags without starting the HTTP listener")
     parser.add_argument("--existing-tagged", choices=("ask", "start", "skip"), default="ask", help="Handle existing Upload tags at startup (default: ask; skip without a terminal)")
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
@@ -211,10 +213,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     watcher = None
     previous_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
     try:
-        if not args.no_tag_watch:
-            watcher = threading.Thread(target=_run_tag_watcher, args=(stop, args.poll_interval, args.existing_tagged), daemon=True)
-            watcher.start()
-        app.run(host=args.host, port=args.port)
+        if args.watch_only:
+            _run_tag_watcher(stop, args.poll_interval, args.existing_tagged)
+        else:
+            if not args.no_tag_watch:
+                watcher = threading.Thread(target=_run_tag_watcher, args=(stop, args.poll_interval, args.existing_tagged), daemon=True)
+                watcher.start()
+            app.run(host=args.host, port=args.port)
+    except KeyboardInterrupt:
+        pass
     finally:
         _server_stopping.set()
         stop.set()
