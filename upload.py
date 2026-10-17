@@ -1310,16 +1310,20 @@ async def process_meta(meta: Meta, base_dir: str) -> bool:
                 status_dict = meta.tracker_status.setdefault(tracker, {})
                 status_dict["skip_upload"] = meta.unattended_audio_skip or meta.unattended_subtitle_skip
 
+        stage_started_at = time.perf_counter()
         await asyncio.sleep(0.2)
         await write_meta_file(meta)
         _publish_webui_preview_target(cast(str, meta.path or ""), meta.uuid or None)
         await asyncio.sleep(0.2)
+        _log_ptp_timing(meta, "pre-check metadata publication (includes fixed sleeps)", stage_started_at)
 
+        stage_started_at = time.perf_counter()
         try:
             await validate_tracker_logins(meta, trackers)
             await asyncio.sleep(0.2)
         except Exception as e:
             logger.warning(f"[yellow]Warning: Tracker validation encountered an error: {e}[/yellow]")
+        _log_ptp_timing(meta, "tracker login validation (includes fixed sleep)", stage_started_at)
 
         tracker_checks_started_at = time.perf_counter()
         successful_trackers = await TrackerStatusManager(config=config).process_all_trackers(meta)

@@ -80,6 +80,16 @@ def test_early_capture_skips_hdr_probe_without_video_metadata() -> None:
     assert meta.hdr == ""
 
 
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_early_timings_before_default_trackers_are_populated(benchmark: bool) -> None:
+    with patch("src.ptp_timing.time.perf_counter", return_value=1.0), patch("src.ptp_timing.logger.info") as log:
+        Prep._log_ptp_timing(Meta(benchmark=benchmark), "disc and category detection", 0.0)
+    if benchmark:
+        log.assert_called_once_with("[PTP timing] disc and category detection: 1.00s")
+    else:
+        log.assert_not_called()
+
+
 def test_personal_release_config_skips_auto_torrent_before_client_search(tmp_path: Path) -> None:
     prep = Prep.__new__(Prep)
     prep.config = {"DEFAULT": {"skip_auto_torrent_personalrelease": True}}

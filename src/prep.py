@@ -120,7 +120,7 @@ class Prep:
     def _log_ptp_timing(meta: Meta, stage: str, started_at: float) -> None:
         selected = meta.trackers
         trackers = selected.split(",") if isinstance(selected, str) else selected or []
-        if any(str(tracker).strip().upper() in {"PTP", "PASSTHEPOPCORN"} for tracker in trackers):
+        if not trackers or any(str(tracker).strip().upper() in {"PTP", "PASSTHEPOPCORN"} for tracker in trackers):
             log_ptp_timing(meta, stage, started_at)
 
     @staticmethod
@@ -179,11 +179,15 @@ class Prep:
         set_run_disabled(bool(getattr(meta, "no_metadata_cache", False)))
 
         # 1. Init metadata settings
+        stage_started_at = time.perf_counter()
         use_sonarr, use_radarr, client, skip_tracker_descriptions, hash_ids, tracker_ids = prep_helpers.init_meta(self, meta, mode)
         await self._publish_initial_webui_snapshot(meta)
+        self._log_ptp_timing(meta, "preparation initialization and initial snapshot", stage_started_at)
+        stage_started_at = time.perf_counter()
         preflight_search = getattr(client, "preflight_qbittorrent_search", None)
         if preflight_search is not None:
             await preflight_search(meta, hash_ids)
+        self._log_ptp_timing(meta, "client preflight", stage_started_at)
 
         # 2. Disc and Category Detection
         stage_started_at = time.perf_counter()
@@ -289,7 +293,9 @@ class Prep:
         # starts consuming the generated files. Any error is logged by the
         # helper; the existing upload-stage capture remains the fallback.
         if early_screenshots_task is not None:
+            stage_started_at = time.perf_counter()
             early_meta = await early_screenshots_task
+            self._log_ptp_timing(meta, "early screenshot wait (blocking remainder)", stage_started_at)
             self._log_ptp_timing(meta, "early screenshot generation (elapsed including overlap)", early_screenshots_started_at)
             if early_meta is not None:
                 if early_meta.tonemapped:

@@ -30,6 +30,7 @@ from src.imdb import imdb_manager, imdb_match_rejection
 from src.languages import languages_manager
 from src.media_extensions import VIDEO_EXTENSIONS
 from src.meta import Meta
+from src.ptp_timing import log_ptp_timing
 from src.region import get_distributor, get_region, get_service
 from src.sports import detect_sports
 from src.tags import get_tag, tag_override
@@ -577,6 +578,7 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
             videopath, filelist, search_term, search_file_folder = prep_instance._resolve_game_filelist(meta, videoloc)
             video = videopath
         else:
+            stage_started_at = time.perf_counter()
             videopath, meta.filelist = await video_manager.get_video(videoloc, meta.sorted_filelist)
             if not videopath or not meta.filelist:
                 raise ValueError(f"No video files found in {videoloc}")
@@ -584,8 +586,10 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
             meta.filelist = filelist
             search_term = Path(filelist[0]).name if filelist else ""
             search_file_folder = "file"
+            log_ptp_timing(meta, "video file discovery", stage_started_at)
 
             # Scan for external subtitle files
+            stage_started_at = time.perf_counter()
             meta.subtitle_files = cast(list[str], [])
             subtitle_exts = {".srt", ".sub", ".vtt", ".ssa", ".ass", ".idx"}
             if meta.isdir:
@@ -606,13 +610,17 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
                             if ext in subtitle_exts and file.lower().startswith(base_name.lower()):
                                 meta.subtitle_files.append(str(Path(Path(parent_dir) / file).resolve()))
             meta.subtitle_files = sorted(set(meta.subtitle_files))
+            log_ptp_timing(meta, "external subtitle discovery", stage_started_at)
 
+        stage_started_at = time.perf_counter()
         video, meta.scene, meta.imdb_id = await prep_instance.scene_manager.is_scene(videopath, meta, meta.imdb_id)
+        log_ptp_timing(meta, "scene release lookup", stage_started_at)
         if meta.category == "BOOK" or (meta.manual_category or "").upper() == "BOOK":
             orig_ext = Path(videopath).suffix
             if video.endswith(".mkv") and not videopath.endswith(".mkv"):
                 video = video[:-4] + orig_ext
 
+        stage_started_at = time.perf_counter()
         try:
             title, secondary_title, extracted_year = await prep_instance.name_manager.extract_title_and_year(meta, video)
             logger.debug(f"Title: {title}, Secondary Title: {secondary_title}, Year: {extracted_year}")
@@ -626,6 +634,8 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
             logger.error(f"[red]Error extracting title and year: {e}[/red]")
             raise Exception(f"Error extracting title and year: {e}") from e
 
+        log_ptp_timing(meta, "title and year extraction", stage_started_at)
+        stage_started_at = time.perf_counter()
         try:
             if title:
                 filename = title
@@ -656,6 +666,7 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
             logger.error(f"[red]Error processing filename: {e}[/red]")
             raise Exception(f"Error processing filename: {e}") from e
 
+        log_ptp_timing(meta, "filename parsing", stage_started_at)
         try:
             if meta.category == "BOOK" or (meta.manual_category or "").upper() == "BOOK":
                 await prep_instance._gather_book_prep(meta, videopath, base_dir)
@@ -981,7 +992,9 @@ async def search_metadata(
     _bdinfo: dict[str, Any],
     mi: dict[str, Any] | None,
 ) -> None:
+    stage_started_at = time.perf_counter()
     await client.finish_hash_metadata_prefetch(meta)
+    log_ptp_timing(meta, "hash metadata prefetch wait (blocking remainder)", stage_started_at)
     # Ensure all manual IDs have proper default values
     meta.tmdb_manual = meta.tmdb_manual or 0
     meta.imdb_manual = meta.imdb_manual or 0
@@ -1103,14 +1116,18 @@ async def search_metadata(
 
         # if not auto qbittorrent search, this also checks with the infohash if passed.
         if _should_lookup_torrent_properties(meta, ids):
+            stage_started_at = time.perf_counter()
             meta = await client.get_ptp_from_hash(meta)
+            log_ptp_timing(meta, "torrent-property metadata lookup", stage_started_at)
 
         tracker_prefetch_matches = _tracker_prefetch_matches(meta, search_term)
         if not meta.edit and (not ids or meta.tracker_ids) and not tracker_prefetch_matches:
             # Reuse information from trackers with fallback
+            stage_started_at = time.perf_counter()
             await prep_instance.tracker_data_manager.get_tracker_data(
                 videopath, meta, search_term, search_file_folder, meta.category, skip_tracker_descriptions=skip_tracker_descriptions
             )
+            log_ptp_timing(meta, "tracker metadata lookup", stage_started_at)
 
         if meta.category == "TV" and use_sonarr and meta.tvdb_id != 0 and ids is None and not meta.matched_tracker:
             ids = await prep_instance.sonarr_manager.get_sonarr_data(tvdb_id=meta.tvdb_id)
