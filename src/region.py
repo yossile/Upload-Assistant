@@ -2744,6 +2744,7 @@ async def get_service(
         "Fandor": "FANDOR",
         "FANDOR": "FANDOR",
         "Fawsome TV": "FSTV",
+        "Fawsome TV": "FAWESOME",
         "FBW": "FBW",
         "FBWatch": "FBW",
         "Filmicca": "FLMC",
