@@ -1,3 +1,4 @@
+import glob
 import stat
 from pathlib import Path
 from unittest.mock import patch
@@ -10,10 +11,12 @@ from src.torrentcreate import TorrentCreator
 
 
 @pytest.mark.asyncio
-async def test_mkbrr_preserves_keep_folder_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("relative_video", ["susan.2025.1080p.web.h264-grashopr.mkv", "Season 01/episode[01].mkv"])
+async def test_mkbrr_preserves_keep_folder_root(tmp_path: Path, relative_video: str) -> None:
     release_dir = tmp_path / "susan.2025.1080p.web.h264-grashopr"
     release_dir.mkdir()
-    video = release_dir / "susan.2025.1080p.web.h264-grashopr.mkv"
+    video = release_dir / relative_video
+    video.parent.mkdir(parents=True, exist_ok=True)
     video.write_bytes(b"video")
     meta = Meta(
         base_dir=str(tmp_path),
@@ -44,17 +47,22 @@ async def test_mkbrr_preserves_keep_folder_root(tmp_path: Path) -> None:
     command = popen.call_args.args[0]
     assert "--include" in command
     include = command[command.index("--include") + 1]
-    assert include == video.name
+    assert include == glob.escape(relative_video)
 
 
 @pytest.mark.asyncio
 async def test_existing_local_mkbrr_is_used_on_unsupported_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
     binary_path = tmp_path / "bin" / "mkbrr"
     binary_path.parent.mkdir()
     binary_path.write_text("#!/bin/sh\n", encoding="utf-8")
     binary_path.chmod(binary_path.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setattr("bin.get_mkbrr.platform.system", lambda: "Android")
     monkeypatch.setattr("bin.get_mkbrr.platform.machine", lambda: "aarch64")
+    monkeypatch.setattr("bin.get_mkbrr.shutil.which", lambda _: None)
+    monkeypatch.setattr("src.torrentcreate.configured_binary", lambda _: None)
+    monkeypatch.setattr("src.torrentcreate.CODE_DIR", code_dir)
 
     assert await MkbrrBinaryManager.ensure_mkbrr_binary(tmp_path, "v1.24.0") == str(binary_path)  # noqa: S101
     assert TorrentCreator.get_mkbrr_path(Meta(base_dir=str(tmp_path))) == str(binary_path)  # noqa: S101

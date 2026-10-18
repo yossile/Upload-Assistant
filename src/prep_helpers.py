@@ -21,8 +21,8 @@ from src.book_prep import AUDIOBOOK_EXTENSIONS, BOOK_EXTENSIONS, BOOK_SERVICES
 from src.cleanup import cleanup_manager
 from src.clients import Clients
 from src.config_helpers import parse_bool
-from src.console import logger
-from src.edition import get_edition
+from src.console import logger, prompt_in_thread
+from src.edition import RELEASE_TOKEN_RE, get_edition
 from src.exceptions import NoAudioMediaError
 from src.exportmi import export_info, get_conformance_error, mi_resolution, validate_mediainfo
 from src.get_source import get_source
@@ -31,7 +31,7 @@ from src.languages import languages_manager
 from src.media_extensions import VIDEO_EXTENSIONS
 from src.meta import Meta
 from src.ptp_timing import log_ptp_timing
-from src.region import get_distributor, get_region, get_service
+from src.region import get_distributor, get_mediainfo_service, get_region, get_service
 from src.sports import detect_sports
 from src.tags import get_tag, tag_override
 from src.tvmaze import tvmaze_manager
@@ -598,8 +598,9 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
                         continue
                     for file in files:
                         ext = Path(file).suffix.lower()
-                        if ext in subtitle_exts:
-                            meta.subtitle_files.append(str(Path(Path(root) / file).resolve()))
+                        if ext in subtitle_exts and not file.startswith("._"):
+                            # Torrent layouts use the link's path within the release.
+                            meta.subtitle_files.append(str((Path(root) / file).absolute()))
             else:
                 parent_dir = str(Path(meta_path).parent)
                 if parent_dir and Path(parent_dir).exists():
@@ -608,7 +609,7 @@ async def process_media_files(prep_instance: Any, meta: Meta, videoloc: str, bdi
                         if (Path(parent_dir) / file).is_file():
                             ext = Path(file).suffix.lower()
                             if ext in subtitle_exts and file.lower().startswith(base_name.lower()):
-                                meta.subtitle_files.append(str(Path(Path(parent_dir) / file).resolve()))
+                                meta.subtitle_files.append(str((Path(parent_dir) / file).absolute()))
             meta.subtitle_files = sorted(set(meta.subtitle_files))
             log_ptp_timing(meta, "external subtitle discovery", stage_started_at)
 
@@ -1504,6 +1505,16 @@ async def finalize_metadata(
                 config=prep_instance.config,
             )
             meta.tvmaze_id = tvmaze_res if isinstance(tvmaze_res, int) else tvmaze_res[0]
+        if meta.tvdb_id == 0 and not both_ids_searched and (meta.imdb_id or meta.tmdb_id):
+            try:
+                series_id, series_name = await prep_instance.tvdb_handler.get_tvdb_by_external_id(imdb=meta.imdb_id, tmdb=meta.tmdb_id, tv_movie=meta.tv_movie)
+                if series_id:
+                    meta.tvdb_id = series_id
+                    if series_name:
+                        meta.tvdb_series_name = series_name
+                    logger.debug(f"[blue]Found TVDB series ID from external IDs: {series_id}[/blue]")
+            except Exception as e:
+                logger.error(f"[red]Error looking up TVDB by external ID: {e}[/red]")
         if meta.tvdb_id == 0:
             logger.debug("[yellow]No TVDB ID found, attempting to fetch...[/yellow]")
             try:
@@ -1745,11 +1756,7 @@ async def finalize_metadata(
         if meta.no_edition is False:
             manual_edition = meta.manual_edition or ""
             meta.edition, meta.repack, meta.webdv = await get_edition(meta.uuid, bdinfo, meta.filelist, manual_edition, meta)
-            if "REPACK" in meta.edition:
-                repack_match = re.search(r"REPACK[\d]?", meta.edition)
-                if repack_match:
-                    meta.repack = repack_match.group(0)
-                meta.edition = re.sub(r"REPACK[\d]?", "", meta.edition).strip().replace("  ", " ")
+            meta.edition = " ".join(RELEASE_TOKEN_RE.sub("", meta.edition).split())
         else:
             meta.edition = ""
 
@@ -1795,6 +1802,19 @@ async def finalize_metadata(
         # Parse NFO for scene releases to get service
         if meta.scene and not meta.service and meta.category in ("TV", "MOVIE"):
             await prep_instance.parse_scene_nfo(meta)
+
+        # MediaInfo signatures are weaker evidence than explicit, filename or NFO services.
+        if not meta.service and (not meta.unattended or meta.unattended_confirm):
+            service, service_longname = await get_mediainfo_service(meta)
+            if service:
+                with contextlib.suppress(EOFError):
+                    if await prompt_in_thread(
+                        cli_ui.ask_yes_no,
+                        f"MediaInfo signature suggests {service} ({service_longname}). Set this as the service?",
+                        default=False,
+                    ):
+                        meta.service, meta.service_longname = service, service_longname
+                        logger.info(f"[green]Confirmed {service} ({service_longname}) from MediaInfo signature[/green]")
 
         # Combine genres from TMDB and IMDb
         tmdb_genres = meta.genres or []

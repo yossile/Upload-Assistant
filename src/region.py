@@ -4,6 +4,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from src.meta import Meta
+
 GuessitFn = Callable[[str, dict[str, Any] | None], dict[str, Any]]
 _guessit_module = importlib.import_module("guessit")
 _guessit_fn: GuessitFn = _guessit_module.guessit
@@ -17,6 +19,7 @@ _REGION_CODES = (
     "AFG",
     "AIA",
     "ALA",
+    "ALB",
     "ALG",
     "AND",
     "ANG",
@@ -38,6 +41,7 @@ _REGION_CODES = (
     "BER",
     "BES",
     "BFA",
+    "BGR",
     "BHR",
     "BHU",
     "BIH",
@@ -73,8 +77,10 @@ _REGION_CODES = (
     "CUW",
     "CXR",
     "CYP",
+    "CZE",
     "DJI",
     "DMA",
+    "DNK",
     "DOM",
     "ECU",
     "EGY",
@@ -83,9 +89,11 @@ _REGION_CODES = (
     "ERI",
     "ESH",
     "ESP",
+    "EST",
     "ETH",
     "EUR",
     "FIJ",
+    "FIN",
     "FLK",
     "FRA",
     "FRO",
@@ -144,7 +152,9 @@ _REGION_CODES = (
     "LES",
     "LIE",
     "LKA",
+    "LTU",
     "LUX",
+    "LVA",
     "MAC",
     "MAD",
     "MAF",
@@ -197,6 +207,7 @@ _REGION_CODES = (
     "QAT",
     "REU",
     "ROU",
+    "RPA",
     "RSA",
     "RUS",
     "RWA",
@@ -205,6 +216,7 @@ _REGION_CODES = (
     "SDN",
     "SEN",
     "SEY",
+    "SGP",
     "SGS",
     "SHN",
     "SIN",
@@ -220,6 +232,8 @@ _REGION_CODES = (
     "STP",
     "SUI",
     "SUR",
+    "SVK",
+    "SWE",
     "SWZ",
     "SXM",
     "SYR",
@@ -3193,3 +3207,41 @@ async def get_service(
     if service_longname in ("Amazon Prime", "Amazon Prime Video"):
         service_longname = "Amazon"
     return service, service_longname
+
+
+def _mediainfo_number(value: Any) -> float | None:
+    """Read numeric JSON fields; MediaInfo bitrates are already in bits/s."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        return float(value)
+    except ValueError, OverflowError:
+        return None
+
+
+async def get_mediainfo_service(meta: Meta) -> tuple[str, str]:
+    """Conservative fallback for the known Amazon 1080p WEB signature."""
+    if meta.service or meta.is_disc or meta.resolution != "1080p" or meta.type not in ("WEBDL", "WEBRIP"):
+        return "", ""
+    if not isinstance(meta.mediainfo, dict):
+        return "", ""
+    media = meta.mediainfo.get("media", {})
+    tracks = media.get("track", []) if isinstance(media, dict) else []
+    if not isinstance(tracks, list):
+        return "", ""
+    video_match = audio_match = False
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        if track.get("@type") == "Video":
+            if track.get("Encoded_Library_Settings"):
+                return "", ""
+            nominal = track.get("BitRate_Nominal") or track.get("NominalBitRate")
+            video_match |= track.get("BitRate_Mode") == "CBR" and _mediainfo_number(nominal) == 10000000
+        elif track.get("@type") == "Audio" and track.get("Format") == "E-AC-3":
+            audio_match |= (_mediainfo_number(track.get("Channels")), _mediainfo_number(track.get("BitRate"))) in ((2, 224000), (6, 640000))
+    if video_match and audio_match:
+        service = await get_service("Example.1080p.AMZN.WEB-DL")
+        if isinstance(service, tuple):
+            return service
+    return "", ""

@@ -122,7 +122,7 @@ const CONFIG_HELP_SECTION_HEADINGS = {
 const DESCRIPTION_HELP_OVERRIDES = {
   add_logo: "Add a TMDb show or movie logo to the top of the description.",
   hide_screenshot_header_if_only_section:
-    "Hide the screenshot header when screenshots are the only section in the description.",
+    "Hide a lone image-section header (screenshots, disc menus, spectrograms or HDR plots). Logos, text and signatures do not count. Tone-mapping notices are preserved.",
 };
 
 const getConfigHelpText = (item, pathParts) => {
@@ -544,7 +544,12 @@ const DEFAULT_WORKFLOW_GROUPS = [
   {
     id: "general",
     label: "General",
-    headings: ["MAIN SETTINGS", "LOGGING", "EXTERNAL TOOL PATHS"],
+    headings: [
+      "MAIN SETTINGS",
+      "WEBUI SETTINGS",
+      "LOGGING",
+      "EXTERNAL TOOL PATHS",
+    ],
   },
   {
     id: "metadata",
@@ -715,6 +720,7 @@ const METADATA_CACHE_SERVICE_GROUPS = [
 
 const CONFIG_HEADING_LABELS = {
   "MAIN SETTINGS": "Main Settings",
+  "WEBUI SETTINGS": "WebUI Settings",
   LOGGING: "Logging",
   "METADATA API CREDENTIALS": "Metadata API Credentials",
   "ARR INTEGRATION": "ARR Integration",
@@ -749,6 +755,8 @@ const CONFIG_HEADING_LABELS = {
 };
 
 const CONFIG_HEADING_DESCRIPTIONS = {
+  "WEBUI SETTINGS":
+    "Control uploads when their browser disconnects. Saved changes apply to newly started uploads. Set the prompt timeout to 0 to wait indefinitely.",
   "EXTERNAL TOOL PATHS":
     "Optional executable overrides. Leave fields blank to use automatically managed tools or executables on the system PATH. Check Tools detects their availability without downloading or installing anything.",
   "PROWLARR CREDENTIAL FALLBACK":
@@ -759,7 +767,6 @@ const EXTERNAL_TOOL_KEYS = [
   "ffmpeg_path",
   "ffprobe_path",
   "mediainfo_path",
-  "dvd_mediainfo_path",
   "bdinfo_path",
   "mkbrr_path",
   "dovi_tool_path",
@@ -978,6 +985,8 @@ const SCREENSHOT_OVERLAY_CHOICES = {
   ],
 };
 const DISPLAY_LABEL_OVERRIDES = {
+  webui_keep_uploads_on_disconnect: "Keep Uploads on Disconnect",
+  webui_unattended_prompt_timeout: "Unattended Prompt Timeout (minutes)",
   frame_overlay: "Enable Frame Overlay",
   overlay_position: "Alignment",
   overlay_layout: "Layout",
@@ -986,7 +995,7 @@ const DISPLAY_LABEL_OVERRIDES = {
   overlay_timestamp: "Timestamp",
   overlay_tonemapped: "Tonemapped Label",
   tag_overrides: "Release Group Overrides",
-  hide_screenshot_header_if_only_section: "Hide Standalone Screenshot Header",
+  hide_screenshot_header_if_only_section: "Hide Standalone Image Header",
   multiScreens: "Multiple Screenshots",
   charLimit: "Character Limit",
   fileLimit: "File Limit",
@@ -1002,6 +1011,7 @@ const DISPLAY_LABEL_OVERRIDES = {
   ptscreens_api: "PTScreens API Key",
   seedpool_cdn_api: "Seedpool CDN API Key",
   sharex_api_key: "ShareX API Key",
+  thrimg_api: "THRImg API Key",
   utppm_api: "UTPPM API Key",
   zipline_api_key: "Zipline API Key",
   ggn_api_key: "GazelleGames API Key",
@@ -1009,7 +1019,6 @@ const DISPLAY_LABEL_OVERRIDES = {
   ffmpeg_path: "FFmpeg",
   ffprobe_path: "FFprobe",
   mediainfo_path: "MediaInfo",
-  dvd_mediainfo_path: "DVD MediaInfo",
   bdinfo_path: "BDInfo",
   mkbrr_path: "mkbrr",
   dovi_tool_path: "Dolby Vision Tool",
@@ -1268,6 +1277,7 @@ const imageHostApiKeys = {
   midnightscene: ["midnightscene_api_key"],
   seedpool_cdn: ["seedpool_cdn_api"],
   sharex: ["sharex_url", "sharex_api_key"],
+  thrimg: ["thrimg_api"],
   utppm: ["utppm_api"],
 };
 
@@ -1297,6 +1307,7 @@ const IMAGE_HOST_LABELS = {
   ptscreens: "PTScreens",
   seedpool_cdn: "Seedpool CDN",
   sharex: "ShareX",
+  thrimg: "THRImg",
   utppm: "UTPPM",
   zipline: "Zipline",
 };
@@ -1515,6 +1526,7 @@ const NumberInput = ({
   min = 0,
   max = 100,
   step = 1,
+  rejectOutOfRange = false,
   className = "",
   isDarkMode = false,
 }) => {
@@ -1542,7 +1554,11 @@ const NumberInput = ({
       return;
     }
     const numValue = Number(draftValue);
-    if (draftValue.trim() === "" || !Number.isFinite(numValue)) {
+    if (
+      draftValue.trim() === "" ||
+      !Number.isFinite(numValue) ||
+      (rejectOutOfRange && (numValue < min || numValue > max))
+    ) {
       setDraftValue(String(normalizedValue));
       return;
     }
@@ -2579,6 +2595,7 @@ function ConfigLeafEditor({
       "rehash_cooldown",
       "custom_layout",
       "screens_per_row",
+      "webui_unattended_prompt_timeout",
     ];
     return numericFields.includes(key);
   };
@@ -2615,6 +2632,8 @@ function ConfigLeafEditor({
   // Hooks for numeric values
   const getDefaultValue = (key) => {
     switch (key) {
+      case "webui_unattended_prompt_timeout":
+        return 60;
       case "mkbrr_threads":
       case "rehash_cooldown":
         return 0;
@@ -2938,6 +2957,13 @@ function ConfigLeafEditor({
     // Define min/max for different fields
     const getFieldLimits = (key) => {
       switch (key) {
+        case "webui_unattended_prompt_timeout":
+          return {
+            min: 0,
+            max: Number.MAX_SAFE_INTEGER,
+            step: "any",
+            rejectOutOfRange: true,
+          };
         case "tracker_pass_checks":
           return { min: 1, max: 20, step: 1 };
         case "mkbrr_threads":
@@ -3032,6 +3058,7 @@ function ConfigLeafEditor({
             min={limits.min}
             max={limits.max}
             step={limits.step}
+            rejectOutOfRange={limits.rejectOutOfRange}
             isDarkMode={isDarkMode}
           />
         </div>

@@ -18,6 +18,119 @@ const parseUploadPaths = (text) => {
 const getPreviewLanguageFlag = window.getUAPreviewLanguageFlag;
 
 const { useState, useRef, useEffect, useLayoutEffect, useCallback } = React;
+const screenshotMode = window.UAScreenshotMode;
+const SCREENSHOT_POSTER_KEY = "ua_screenshot_poster";
+const SCREENSHOT_BACKDROP_KEY = "ua_screenshot_backdrop";
+
+const getStoredScreenshotArtwork = (key) => {
+  try {
+    const image = localStorage.getItem(key) || "";
+    return /^data:image\/(png|jpeg|webp);base64,/.test(image) ? image : "";
+  } catch (_error) {
+    return "";
+  }
+};
+
+function ScreenshotModeControls({ onPoster, onBackdrop }) {
+  const [visible, setVisible] = useState(true);
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    const toggle = (event) => {
+      if (
+        event.key.toLowerCase() === "h" &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.target.closest("input, textarea, select, [contenteditable]")
+      )
+        setVisible((value) => !value);
+    };
+    document.addEventListener("keydown", toggle);
+    return () => document.removeEventListener("keydown", toggle);
+  }, []);
+
+  const selectArtwork = (event, label, storageKey, onSelect) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (
+      !["image/png", "image/jpeg", "image/webp"].includes(file.type) ||
+      file.size > 4 * 1024 * 1024
+    ) {
+      setMessage("Choose a PNG, JPEG or WebP image up to 4 MiB.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () =>
+      setMessage(`Unable to read this ${label.toLowerCase()}.`);
+    reader.onload = () => {
+      onSelect(reader.result);
+      try {
+        localStorage.setItem(storageKey, reader.result);
+        setMessage(`${label} saved in this browser.`);
+      } catch (_error) {
+        setMessage(
+          `${label} loaded for this tab; browser storage is unavailable or full.`,
+        );
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  if (!visible) return null;
+  return (
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 rounded-lg border border-gray-600 bg-gray-900 text-white px-4 py-3 shadow-xl text-sm max-w-[90vw]">
+      <div className="flex flex-wrap items-center gap-3">
+        <strong>Screenshot mode</strong>
+        <label className="cursor-pointer rounded bg-gray-700 px-3 py-1">
+          Choose poster
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            onChange={(event) =>
+              selectArtwork(event, "Poster", SCREENSHOT_POSTER_KEY, onPoster)
+            }
+            className="sr-only"
+          />
+        </label>
+        <label className="cursor-pointer rounded bg-gray-700 px-3 py-1">
+          Choose backdrop
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            onChange={(event) =>
+              selectArtwork(
+                event,
+                "Backdrop",
+                SCREENSHOT_BACKDROP_KEY,
+                onBackdrop,
+              )
+            }
+            className="sr-only"
+          />
+        </label>
+        <button
+          onClick={() => setVisible(false)}
+          className="rounded bg-gray-700 px-3 py-1"
+        >
+          Hide controls (H)
+        </button>
+        <a href={window.location.pathname} className="underline">
+          Exit demo
+        </a>
+      </div>
+      <p className="mt-1 text-xs text-gray-300">
+        Frozen fictional data · API actions disabled · Press H to show/hide
+        controls.
+      </p>
+      {message && (
+        <p role="status" className="mt-1 text-xs">
+          {message}
+        </p>
+      )}
+    </div>
+  );
+}
 const THEME_KEY = "ua_config_theme";
 const LEFT_SIDEBAR_WIDTH_KEY = "ua_webui_left_sidebar_width_v2";
 const RIGHT_SIDEBAR_WIDTH_KEY = "ua_webui_right_sidebar_width";
@@ -46,6 +159,116 @@ const isMobileBrowserSession = () => {
 
 const shouldUseMobileLayout = () =>
   window.innerWidth < COMPACT_LAYOUT_BREAKPOINT || isMobileBrowserSession();
+
+// Each running tab holds one SSE stream; the server enforces the same limit.
+// Idle tabs are cheap; only running uploads hold connections and server slots.
+const MAX_UPLOAD_TABS = 24;
+const DEFAULT_MAX_RUNNING_UPLOADS = 4;
+const SCHEDULE_POLL_MS = 3000;
+// One /api/sessions request per interval serves every scheduled tab.
+const sharedSessionsPoll = { promise: null, at: 0 };
+const UPLOAD_TAB_DRAFTS_KEY = "ua.uploadTabDrafts.v1";
+const BUSY_UPLOAD_STATUSES = ["running", "waiting", "input"];
+// The server sends a keepalive every second; silence this long means a dead connection.
+const SESSION_STREAM_STALL_MS = 20000;
+const SESSION_RECONNECT_ATTEMPTS = 60;
+
+const UPLOAD_TAB_STATUS_LABELS = {
+  idle: "Idle",
+  running: "Running",
+  waiting: "Waiting for another tab to free a shared resource",
+  input: "Waiting for your input",
+  scheduled: "Scheduled: starts when an upload slot frees",
+  done: "Finished",
+  error: "Failed",
+};
+
+const createUploadTabForm = () => ({
+  selectedPath: "",
+  selectedPaths: [],
+  manualPathsText: null,
+  customArgs: "",
+  pathInputError: "",
+  selectedArgumentPreset: "",
+  userInput: "",
+});
+
+/** Per-tab state that must survive while the tab is not displayed. */
+const createUploadTabRuntime = () => ({
+  output: document.createElement("div"),
+  controller: null,
+  lastFullHash: "",
+  // Last session event applied, so reconnects replay only what was missed.
+  lastSeq: 0,
+  // Server session shown in this tab; dismissed when the tab moves on.
+  sessionRecord: "",
+  // Waiting on the server for a free upload slot.
+  scheduled: false,
+  // Authoritative for every tab; React state mirrors only the active tab.
+  run: { sessionId: "", isExecuting: false },
+  // Snapshot of view state, read while the tab is in the background.
+  view: {
+    isTerminalView: false,
+    progressItems: [],
+    form: createUploadTabForm(),
+  },
+  awaiting: false,
+  waiting: new Set(),
+  result: "",
+});
+
+const getUploadTabStatus = (runtime) => {
+  if (!runtime.run.isExecuting) return runtime.result || "idle";
+  if (runtime.scheduled) return "scheduled";
+  if (runtime.awaiting) return "input";
+  return runtime.waiting.size ? "waiting" : "running";
+};
+
+const uploadTabFormHasContent = (form) =>
+  Boolean(
+    form &&
+    (form.selectedPath ||
+      form.selectedPaths?.length ||
+      form.manualPathsText ||
+      form.customArgs),
+  );
+
+/** Read prepared-but-not-started tab forms saved by this browser. */
+const loadUploadTabDrafts = () => {
+  try {
+    const drafts = JSON.parse(
+      window.localStorage.getItem(UPLOAD_TAB_DRAFTS_KEY) || "[]",
+    );
+    return Array.isArray(drafts)
+      ? drafts.filter((draft) => uploadTabFormHasContent(draft?.form))
+      : [];
+  } catch (error) {
+    return [];
+  }
+};
+
+const saveUploadTabDrafts = (drafts) => {
+  try {
+    if (drafts.length) {
+      window.localStorage.setItem(
+        UPLOAD_TAB_DRAFTS_KEY,
+        JSON.stringify(drafts),
+      );
+    } else {
+      window.localStorage.removeItem(UPLOAD_TAB_DRAFTS_KEY);
+    }
+  } catch (error) {
+    /* Storage can be unavailable (private mode, quota); drafts are a convenience. */
+  }
+};
+
+const getUploadTabTitle = (items) => {
+  if (items.length !== 1) return `Queue (${items.length})`;
+  const parts = String(items[0].path || "")
+    .split(/[\\/]/)
+    .filter(Boolean);
+  return parts[parts.length - 1] || items[0].path;
+};
 
 const storage = window.UAStorage;
 const getStoredTheme = window.getUAStoredTheme;
@@ -201,6 +424,15 @@ const renderBbcodePreview = (content) => {
   );
 };
 
+// Pointer coordinates are fractional under browser zoom or OS display scaling.
+// Keeping panel widths on whole device pixels stops right-aligned mask icons
+// from being resampled at a different sub-pixel offset on every resize step,
+// which made them appear to grow and shrink while dragging.
+const snapToDevicePixels = (width) => {
+  const ratio = window.devicePixelRatio || 1;
+  return Math.round(width * ratio) / ratio;
+};
+
 const getStoredSidebarWidth = (
   key,
   defaultWidth,
@@ -213,7 +445,7 @@ const getStoredSidebarWidth = (
     storedWidth >= minWidth &&
     storedWidth <= maxWidth
   ) {
-    return storedWidth;
+    return snapToDevicePixels(storedWidth);
   }
   return defaultWidth;
 };
@@ -325,6 +557,7 @@ const loadLocalCsrf = async (force = false) => {
 // Prefer shared `uaApiFetch` when available (provides CSRF handling and retry-on-auth-fail),
 // otherwise fall back to a local implementation.
 const apiFetch =
+  screenshotMode?.apiFetch ||
   (typeof window !== "undefined" && window.uaApiFetch) ||
   (async (url, options = {}) => {
     // Local fallback: load CSRF token once and retry on 401/403 once.
@@ -1088,6 +1321,10 @@ const DescriptionIcon = () => (
   <LucideIcon name="text-initial" className="w-5 h-5" />
 );
 
+const MediaInfoIcon = () => (
+  <LucideIcon name="file-search" className="w-5 h-5" />
+);
+
 const PaletteIcon = () => <WebUiIcon name="palette" />;
 
 const SettingsIcon = () => <WebUiIcon name="config" />;
@@ -1465,6 +1702,16 @@ const DiscIcon = () => <WebUiIcon name="music" />;
 
 const PepperIcon = () => <WebUiIcon name="pepper" />;
 
+// The review grid groups frames by disc/playlist; navigation follows that order.
+const orderScreenshotsByGroup = (screenshots) =>
+  Object.values(
+    screenshots.reduce((groups, screenshot) => {
+      const group = screenshot.group || "main";
+      (groups[group] ||= []).push(screenshot);
+      return groups;
+    }, {}),
+  ).flat();
+
 const mediaIconForCategory = (category) => {
   switch (String(category || "").toUpperCase()) {
     case "MOVIE":
@@ -1739,12 +1986,28 @@ function AudionutsUAGUI() {
   const [showAllSupportedTrackers, setShowAllSupportedTrackers] =
     useState(false);
   const [failedFavicons, setFailedFavicons] = useState(new Set());
-  const [isExecuting, setIsExecuting] = useState(false);
-  const [isTerminalView, setIsTerminalView] = useState(false);
+  const [isExecuting, setIsExecuting] = useState(Boolean(screenshotMode));
+  const [isTerminalView, setIsTerminalView] = useState(Boolean(screenshotMode));
   const [expandedFolders, setExpandedFolders] = useState(
     getStoredExpandedFolders,
   );
   const [sessionId, setSessionId] = useState("");
+  const [uploadTabs, setUploadTabs] = useState(() =>
+    screenshotMode
+      ? screenshotMode.tabs.map((tab, index) => ({
+          ...tab,
+          id: `tab-${index + 1}`,
+          number: index + 1,
+        }))
+      : [{ id: "tab-1", number: 1, title: "", status: "idle" }],
+  );
+  const [activeTabId, setActiveTabId] = useState("tab-1");
+  const [pendingCloseTabId, setPendingCloseTabId] = useState("");
+  const [maxRunningUploads, setMaxRunningUploads] = useState(
+    DEFAULT_MAX_RUNNING_UPLOADS,
+  );
+  const [schedulingEnabled, setSchedulingEnabled] = useState(true);
+  const [uploadTabsRestored, setUploadTabsRestored] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     getStoredSidebarWidth(
       LEFT_SIDEBAR_WIDTH_KEY,
@@ -1781,29 +2044,52 @@ function AudionutsUAGUI() {
   const [collapsedSections, setCollapsedSections] = useState(
     () => new Set(getStoredCollapsedSections()),
   );
-  const [executionPreview, setExecutionPreview] = useState(null);
+  const [executionPreview, setExecutionPreview] = useState(() => {
+    if (!screenshotMode) return null;
+    return {
+      ...screenshotMode.media,
+      poster_url: getStoredScreenshotArtwork(SCREENSHOT_POSTER_KEY),
+      backdrop_url: getStoredScreenshotArtwork(SCREENSHOT_BACKDROP_KEY),
+    };
+  });
   const [showAudioTracks, setShowAudioTracks] = useState(
     () => storage.get(SHOW_AUDIO_TRACKS_KEY) === "true",
   );
   const [showSubtitleTracks, setShowSubtitleTracks] = useState(
     () => storage.get(SHOW_SUBTITLE_TRACKS_KEY) === "true",
   );
-  const [executionScreenshots, setExecutionScreenshots] = useState([]);
-  const [executionDescription, setExecutionDescription] = useState(null);
-  const [descriptionDraft, setDescriptionDraft] = useState("");
+  const [executionScreenshots, setExecutionScreenshots] = useState(
+    () => screenshotMode?.screenshots || [],
+  );
+  const [executionDescription, setExecutionDescription] = useState(
+    () => screenshotMode?.description || null,
+  );
+  const [descriptionDraft, setDescriptionDraft] = useState(
+    () => screenshotMode?.description.content || "",
+  );
   const [descriptionView, setDescriptionView] = useState("edit");
-  const [descriptionVersion, setDescriptionVersion] = useState(0);
+  const [descriptionVersion, setDescriptionVersion] = useState(
+    () => screenshotMode?.description.version || 0,
+  );
   const [descriptionDirty, setDescriptionDirty] = useState(false);
   const descriptionDirtyRef = useRef(false);
-  const descriptionVersionRef = useRef(0);
+  const descriptionVersionRef = useRef(
+    screenshotMode?.description.version || 0,
+  );
   const descriptionEditorRef = useRef(null);
   const [descriptionAction, setDescriptionAction] = useState("");
-  const [canAddExecutionScreenshot, setCanAddExecutionScreenshot] =
-    useState(false);
+  const [canAddExecutionScreenshot, setCanAddExecutionScreenshot] = useState(
+    Boolean(screenshotMode),
+  );
   const [screenshotActionId, setScreenshotActionId] = useState("");
   const [coverAction, setCoverAction] = useState("");
   const coverRequestRef = useRef(0);
   const [expandedScreenshot, setExpandedScreenshot] = useState(null);
+  const [isScreenshotZoomed, setIsScreenshotZoomed] = useState(false);
+  const [expandedScreenshotSize, setExpandedScreenshotSize] = useState(null);
+  const [screenshotError, setScreenshotError] = useState("");
+  const [pendingDeleteScreenshot, setPendingDeleteScreenshot] = useState("");
+  const expandedScreenshotIndexRef = useRef(0);
   const themePaletteRef = useRef(null);
   const screenshotModalRef = useModalFocus(
     () => setExpandedScreenshot(null),
@@ -1815,7 +2101,24 @@ function AudionutsUAGUI() {
   }, [descriptionDirty]);
   const [isScreenshotReviewOpen, setIsScreenshotReviewOpen] = useState(false);
   const [isDescriptionReviewOpen, setIsDescriptionReviewOpen] = useState(false);
-  const [progressItems, setProgressItems] = useState([]);
+  const [isMediaInfoOpen, setIsMediaInfoOpen] = useState(false);
+  const [executionMediaInfo, setExecutionMediaInfo] = useState(
+    () => screenshotMode?.mediainfo || null,
+  );
+  const [mediaInfoStatus, setMediaInfoStatus] = useState(
+    screenshotMode ? "ready" : "idle",
+  );
+  const [selectedMediaInfoKey, setSelectedMediaInfoKey] = useState(
+    () => screenshotMode?.mediainfo.reports[0]?.key || "",
+  );
+  const [mediaInfoCopied, setMediaInfoCopied] = useState(false);
+  const mediaInfoTargetRef = useRef("");
+  // Desktop-only enlarged view of one review panel; the sidebar keeps showing
+  // the media preview meanwhile so a panel is never mounted twice.
+  const [expandedReviewPanel, setExpandedReviewPanel] = useState("");
+  const [progressItems, setProgressItems] = useState(
+    screenshotMode?.media.progress || [],
+  );
   const [selectedPaths, setSelectedPaths] = useState([]);
   const [sortBy, setSortBy] = useState(() => getStoredFileBrowserSort().by);
   const [sortOrder, setSortOrder] = useState(
@@ -1835,6 +2138,7 @@ function AudionutsUAGUI() {
       : null;
 
   useEffect(() => {
+    if (screenshotMode) return undefined;
     if (!window.loadUAUpdateStatus) return undefined;
     let cancelled = false;
     const loadUpdateStatus = () => {
@@ -1926,6 +2230,7 @@ function AudionutsUAGUI() {
   useEffect(() => {
     let cancelled = false;
     const loadArgumentPresets = async () => {
+      if (screenshotMode) return;
       try {
         const response = await apiFetch(`${API_BASE}/argument_presets`);
         if (!response.ok) return;
@@ -2232,10 +2537,100 @@ function AudionutsUAGUI() {
   const [descLinkFocused, setDescLinkFocused] = useState(false);
 
   const richOutputRef = useRef(null);
-  const lastFullHashRef = useRef("");
   const inputRef = useRef(null);
   const isSendingInputRef = useRef(false);
-  const sseAbortControllerRef = useRef(null);
+  const activeTabIdRef = useRef("tab-1");
+  const uploadTabCounterRef = useRef(1);
+  const tabRuntimeRef = useRef(null);
+  if (tabRuntimeRef.current === null) {
+    const firstTab = createUploadTabRuntime();
+    firstTab.run.isExecuting = Boolean(screenshotMode);
+    tabRuntimeRef.current = new Map([["tab-1", firstTab]]);
+    // Demo background tabs only feed the tab bar; switching to them is disabled.
+    screenshotMode?.tabs.slice(1).forEach((tab, index) => {
+      const runtime = createUploadTabRuntime();
+      runtime.run.isExecuting = ["running", "input", "scheduled"].includes(
+        tab.status,
+      );
+      runtime.awaiting = tab.status === "input";
+      runtime.scheduled = tab.status === "scheduled";
+      if (!runtime.run.isExecuting) runtime.result = tab.status;
+      tabRuntimeRef.current.set(`tab-${index + 2}`, runtime);
+    });
+    uploadTabCounterRef.current = tabRuntimeRef.current.size;
+  }
+
+  const getTabRuntime = (tabId) => tabRuntimeRef.current.get(tabId);
+
+  const refreshUploadTabStatus = (tabId) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
+    const status = getUploadTabStatus(runtime);
+    setUploadTabs((tabs) =>
+      tabs.map((tab) =>
+        tab.id === tabId && tab.status !== status ? { ...tab, status } : tab,
+      ),
+    );
+  };
+
+  /**
+   * Update a tab's run state. Background tabs keep it in their runtime; the
+   * active tab also mirrors it into React state so the existing UI renders it.
+   */
+  const updateTabRun = (tabId, patch) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
+    const isActive = tabId === activeTabIdRef.current;
+    if ("sessionId" in patch) {
+      runtime.run.sessionId = patch.sessionId;
+      if (isActive) setSessionId(patch.sessionId);
+    }
+    if ("isExecuting" in patch) {
+      runtime.run.isExecuting = patch.isExecuting;
+      if (isActive) setIsExecuting(patch.isExecuting);
+    }
+    if ("progressItems" in patch) {
+      const value = patch.progressItems;
+      if (isActive) setProgressItems(value);
+      else
+        runtime.view.progressItems =
+          typeof value === "function"
+            ? value(runtime.view.progressItems)
+            : value;
+    }
+    refreshUploadTabStatus(tabId);
+  };
+
+  const scrollTabOutput = (tabId) => {
+    if (tabId !== activeTabIdRef.current) return;
+    const host = richOutputRef.current;
+    if (!host) return;
+    // Scroll only the terminal, including while its view is hidden.
+    setTimeout(() => {
+      host.scrollTop = host.scrollHeight;
+    }, 0);
+  };
+
+  const mountActiveTabOutput = () => {
+    const host = richOutputRef.current;
+    const runtime = getTabRuntime(activeTabIdRef.current);
+    if (!host || !runtime) return;
+    if (host.firstChild !== runtime.output || host.childNodes.length !== 1) {
+      host.replaceChildren(runtime.output);
+    }
+    host.scrollTop = host.scrollHeight;
+  };
+
+  // Each tab owns a detached output node; the visible terminal shows the active one.
+  const attachRichOutputHost = useCallback((node) => {
+    richOutputRef.current = node;
+    if (node) mountActiveTabOutput();
+  }, []);
+
+  useEffect(() => {
+    mountActiveTabOutput();
+  }, [activeTabId]);
+
   const visibleProgressItems = progressItems.filter(
     (item) => item.status !== "completed",
   );
@@ -2264,52 +2659,68 @@ function AudionutsUAGUI() {
     return sortProgressItems([...itemsById.values()]);
   };
 
-  const applyProgressEvent = (event) => {
+  const applyProgressEvent = (event, tabId = activeTabIdRef.current) => {
     if (!event || typeof event !== "object") return;
+    const runtime = getTabRuntime(tabId);
     if (event.op === "reset") {
-      setProgressItems([]);
+      runtime?.waiting.clear();
+      updateTabRun(tabId, { progressItems: [] });
       return;
     }
     if (!event.id) return;
-    setProgressItems((prev) => {
-      const existingIndex = prev.findIndex((item) => item.id === event.id);
-      if (existingIndex === -1) {
-        return sortProgressItems([...prev, event]);
-      }
-      const next = [...prev];
-      next[existingIndex] = { ...next[existingIndex], ...event };
-      return sortProgressItems(next);
+    // The backend reports cross-tab resource waits as "wait-<resource>" items.
+    if (runtime && String(event.id).startsWith("wait-")) {
+      if (event.status === "waiting") runtime.waiting.add(event.id);
+      else runtime.waiting.delete(event.id);
+    }
+    updateTabRun(tabId, {
+      progressItems: (prev) => {
+        const existingIndex = prev.findIndex((item) => item.id === event.id);
+        if (existingIndex === -1) {
+          return sortProgressItems([...prev, event]);
+        }
+        const next = [...prev];
+        next[existingIndex] = { ...next[existingIndex], ...event };
+        return sortProgressItems(next);
+      },
     });
   };
 
-  const renderProgressPanel = (compact = false) => {
+  const renderProgressPanel = (compact = false, showHeader = true) => {
     if (!visibleProgressItems.length) return null;
 
     return (
       <div
         className={`rounded-lg border p-3 shadow-xl backdrop-blur-sm ${isDarkMode ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white/95"}`}
       >
-        <div className="flex items-center justify-between gap-3 mb-3">
-          <div>
-            <h4
-              className={`font-semibold ${compact ? "text-sm" : "text-base"} ${isDarkMode ? "text-white" : "text-gray-900"}`}
+        {showHeader && (
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div>
+              <h4
+                className={`font-semibold ${compact ? "text-sm" : "text-base"} ${isDarkMode ? "text-white" : "text-gray-900"}`}
+              >
+                Binary Progress
+              </h4>
+              <p
+                className={`text-xs ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
+              >
+                Live progress from external tools
+              </p>
+            </div>
+            <span
+              className={`text-xs font-medium ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
             >
-              Binary Progress
-            </h4>
-            <p
-              className={`text-xs ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
-            >
-              Live progress from external tools
-            </p>
+              {visibleProgressItems.length} active
+            </span>
           </div>
-          <span
-            className={`text-xs font-medium ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
-          >
-            {visibleProgressItems.length} active
-          </span>
-        </div>
+        )}
+        {/* Only the floating panel caps its height; the sidebar already scrolls. */}
         <div
-          className={`${compact ? "space-y-2" : "space-y-3"} max-h-[40vh] overflow-y-auto pr-1`}
+          className={
+            compact
+              ? "space-y-2 max-h-[40vh] overflow-y-auto pr-1"
+              : "space-y-3"
+          }
         >
           {visibleProgressItems.map((item) => {
             const current = Number(item.current ?? 0);
@@ -2320,6 +2731,9 @@ function AudionutsUAGUI() {
               : 0;
             const isCompleted = item.status === "completed";
             const isFailed = item.status === "failed";
+            // Speed meters show a rate against a limit: green when under it, amber when over.
+            const isSpeedMeter = item.unit === "kbps";
+            const isOverLimit = isSpeedMeter && hasTotal && current > total;
             const statusTone = isCompleted
               ? isDarkMode
                 ? "text-emerald-300"
@@ -2328,16 +2742,30 @@ function AudionutsUAGUI() {
                 ? isDarkMode
                   ? "text-rose-300"
                   : "text-rose-700"
-                : "ua-accent-text";
+                : isSpeedMeter
+                  ? isOverLimit
+                    ? isDarkMode
+                      ? "text-amber-300"
+                      : "text-amber-700"
+                    : isDarkMode
+                      ? "text-emerald-300"
+                      : "text-emerald-700"
+                  : "ua-accent-text";
             const progressTone = isCompleted
               ? "bg-emerald-500"
               : isFailed
                 ? "bg-rose-500"
-                : "ua-accent-indicator";
+                : isSpeedMeter
+                  ? isOverLimit
+                    ? "bg-amber-500"
+                    : "bg-emerald-500"
+                  : "ua-accent-indicator";
             let summary = "";
             if (hasTotal) {
               if (item.unit === "percent")
                 summary = `${Math.round(clampedPercent)}%`;
+              else if (isSpeedMeter)
+                summary = `${Math.round(current)} / ${Math.round(total)} KB/s`;
               else summary = `${Math.round(current)}/${Math.round(total)}`;
             }
             return (
@@ -2403,12 +2831,21 @@ function AudionutsUAGUI() {
     return (
       <div className="flex flex-col h-full">
         <div className="ua-upload-panel-header p-3 border-b flex-shrink-0">
-          <h2
-            className={`text-base font-bold ${isDarkMode ? "text-white" : "text-gray-800"} flex items-center gap-2`}
-          >
-            <ProgressIcon />
-            Binary Progress
-          </h2>
+          <div className="flex items-center justify-between gap-3">
+            <h2
+              className={`text-base font-bold ${isDarkMode ? "text-white" : "text-gray-800"} flex items-center gap-2`}
+            >
+              <ProgressIcon />
+              Binary Progress
+            </h2>
+            {visibleProgressItems.length > 0 && (
+              <span
+                className={`text-xs font-medium ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
+              >
+                {visibleProgressItems.length} active
+              </span>
+            )}
+          </div>
           <p
             className={`text-xs mt-1 ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
           >
@@ -2416,7 +2853,7 @@ function AudionutsUAGUI() {
           </p>
         </div>
         <div className="flex-1 overflow-y-auto p-3">
-          {renderProgressPanel() || (
+          {renderProgressPanel(false, false) || (
             <div
               className={`rounded-lg border p-5 text-center text-sm ${isDarkMode ? "border-gray-700 bg-gray-800 text-gray-400" : "border-gray-200 bg-gray-50 text-gray-500"}`}
             >
@@ -3077,6 +3514,7 @@ function AudionutsUAGUI() {
   }, [hasDescFile, hasDescLink]);
 
   useEffect(() => {
+    if (screenshotMode) return undefined;
     coverRequestRef.current += 1;
     if (!isExecuting || !sessionId) {
       setExecutionPreview(null);
@@ -3091,10 +3529,18 @@ function AudionutsUAGUI() {
       setCanAddExecutionScreenshot(false);
       setCoverAction("");
       setExpandedScreenshot(null);
+      setScreenshotError("");
+      setPendingDeleteScreenshot("");
       setIsScreenshotReviewOpen(false);
       setIsDescriptionReviewOpen(false);
+      setIsMediaInfoOpen(false);
+      setExpandedReviewPanel("");
+      setExecutionMediaInfo(null);
+      setMediaInfoStatus("idle");
       setActivePanel((panel) =>
-        ["screenshots", "description"].includes(panel) ? "main" : panel,
+        ["screenshots", "description", "mediainfo"].includes(panel)
+          ? "main"
+          : panel,
       );
       return undefined;
     }
@@ -3200,6 +3646,164 @@ function AudionutsUAGUI() {
     setCoverAction("");
   }, [executionPreview?.media_id]);
 
+  const isMediaInfoVisible = isMediaInfoOpen || activePanel === "mediainfo";
+  const mediaInfoLabel =
+    executionMediaInfo?.kind === "bdinfo" ? "BDInfo" : "MediaInfo";
+  // Hide review panels a category never produces. While the category is still
+  // unknown every button stays visible so nothing that will exist is hidden.
+  const executionCategory = String(
+    executionPreview?.category || "",
+  ).toUpperCase();
+  const showScreenshotsButton = !(
+    executionCategory === "MUSIC" ||
+    (executionCategory === "BOOK" && executionPreview?.audiobook)
+  );
+  const showMediaInfoButton = executionCategory !== "GAME";
+
+  useEffect(() => {
+    if (!showScreenshotsButton) {
+      setExpandedScreenshot(null);
+      setIsScreenshotReviewOpen(false);
+      setExpandedReviewPanel((panel) => (panel === "screenshots" ? "" : panel));
+      setActivePanel((panel) => (panel === "screenshots" ? "main" : panel));
+    }
+  }, [showScreenshotsButton]);
+
+  useEffect(() => {
+    if (!showMediaInfoButton) {
+      setIsMediaInfoOpen(false);
+      setExpandedReviewPanel((panel) => (panel === "mediainfo" ? "" : panel));
+      setActivePanel((panel) => (panel === "mediainfo" ? "main" : panel));
+    }
+  }, [showMediaInfoButton]);
+
+  useEffect(() => {
+    // Reports are large and rarely change, so load them only while the panel
+    // is visible and retry until the run has generated them.
+    if (screenshotMode || !isExecuting || !sessionId || !isMediaInfoVisible) {
+      return undefined;
+    }
+    let cancelled = false;
+    let timeoutId;
+    const controller = new AbortController();
+
+    const loadMediaInfo = async () => {
+      try {
+        const response = await apiFetch(
+          `${API_BASE}/execution_mediainfo?session_id=${encodeURIComponent(sessionId)}`,
+          { cache: "no-store", signal: controller.signal },
+        );
+        const data = await response.json().catch(() => null);
+        if (cancelled) return;
+        if (response.ok && data?.success && Array.isArray(data.reports)) {
+          setExecutionMediaInfo(data);
+          setMediaInfoStatus("ready");
+          setSelectedMediaInfoKey((key) =>
+            data.reports.some((report) => report.key === key)
+              ? key
+              : data.reports[0]?.key || "",
+          );
+          return;
+        }
+        setExecutionMediaInfo(null);
+        setMediaInfoStatus(response.status === 404 ? "pending" : "error");
+      } catch (_error) {
+        if (cancelled) return;
+        setMediaInfoStatus("error");
+      }
+      timeoutId = window.setTimeout(loadMediaInfo, 3000);
+    };
+
+    // Reopening the panel keeps the cached report; a different execution or
+    // file must not show (or copy) the previous release's report meanwhile.
+    const mediaInfoTarget = `${sessionId}\n${executionPreview?.path || ""}`;
+    if (mediaInfoTargetRef.current !== mediaInfoTarget) {
+      mediaInfoTargetRef.current = mediaInfoTarget;
+      setExecutionMediaInfo(null);
+      setMediaInfoStatus("loading");
+    } else {
+      setMediaInfoStatus((status) => (status === "ready" ? status : "loading"));
+    }
+    loadMediaInfo();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+      controller.abort();
+    };
+  }, [
+    API_BASE,
+    isExecuting,
+    sessionId,
+    isMediaInfoVisible,
+    executionPreview?.path,
+  ]);
+
+  const closeReviewModal = () => {
+    // The screenshot lightbox handles its own Escape key first.
+    if (expandedScreenshot) return;
+    if (expandedReviewPanel === "description" && descriptionDirty) {
+      saveExecutionDescription();
+    }
+    setExpandedReviewPanel("");
+  };
+  const reviewModalRef = useModalFocus(
+    closeReviewModal,
+    Boolean(expandedReviewPanel),
+  );
+
+  useEffect(() => {
+    if (isMobile) setExpandedReviewPanel("");
+  }, [isMobile]);
+
+  const renderReviewExpandButton = (panel) => {
+    if (isMobile) return null;
+    const isExpanded = expandedReviewPanel === panel;
+    const label = isExpanded ? "Return to sidebar" : "Open in a larger view";
+    return (
+      <button
+        type="button"
+        onClick={() =>
+          isExpanded ? closeReviewModal() : setExpandedReviewPanel(panel)
+        }
+        className={`flex-none rounded-md p-2 transition-colors ${isDarkMode ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-100"}`}
+        title={label}
+        aria-label={label}
+      >
+        <LucideIcon
+          name={isExpanded ? "minimize-2" : "maximize-2"}
+          className="w-4 h-4"
+        />
+      </button>
+    );
+  };
+
+  const copyMediaInfoReport = async (content) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        // navigator.clipboard only exists in secure contexts; plain-HTTP LAN access needs the legacy path.
+        const area = document.createElement("textarea");
+        area.value = content;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        const copied = document.execCommand("copy");
+        area.remove();
+        if (!copied) throw new Error("Copy failed");
+      }
+      setMediaInfoCopied(true);
+      window.setTimeout(() => setMediaInfoCopied(false), 1500);
+    } catch (_error) {
+      setMediaInfoCopied(false);
+    }
+  };
+
   const refreshExecutionScreenshots = async () => {
     const refreshed = await apiFetch(
       `${API_BASE}/execution_screenshots?session_id=${encodeURIComponent(sessionId)}`,
@@ -3216,6 +3820,7 @@ function AudionutsUAGUI() {
   const changeExecutionScreenshot = async (screenshotId, action) => {
     if (!sessionId || screenshotActionId) return;
     setScreenshotActionId(`${action}:${screenshotId}`);
+    setScreenshotError("");
     try {
       const response = await apiFetch(
         `${API_BASE}/execution_screenshots/${encodeURIComponent(screenshotId)}/${action}`,
@@ -3227,13 +3832,13 @@ function AudionutsUAGUI() {
       );
       const data = await response.json().catch(() => null);
       if (!response.ok || !data?.success) {
-        window.alert(data?.error || `Could not ${action} screenshot.`);
+        setScreenshotError(data?.error || `Could not ${action} screenshot.`);
         return;
       }
       await refreshExecutionScreenshots();
     } catch (error) {
       console.error(`Could not ${action} screenshot:`, error);
-      window.alert(`Could not ${action} screenshot. Please try again.`);
+      setScreenshotError(`Could not ${action} screenshot. Please try again.`);
     } finally {
       setScreenshotActionId("");
     }
@@ -3276,6 +3881,7 @@ function AudionutsUAGUI() {
   const addExecutionScreenshot = async (group = "main") => {
     if (!sessionId || screenshotActionId || !canAddExecutionScreenshot) return;
     setScreenshotActionId("add");
+    setScreenshotError("");
     try {
       const response = await apiFetch(`${API_BASE}/execution_screenshots/add`, {
         method: "POST",
@@ -3284,27 +3890,65 @@ function AudionutsUAGUI() {
       });
       const data = await response.json().catch(() => null);
       if (!response.ok || !data?.success) {
-        window.alert(data?.error || "Could not add screenshot.");
+        setScreenshotError(data?.error || "Could not add screenshot.");
         return;
       }
       await refreshExecutionScreenshots();
     } catch (error) {
       console.error("Could not add screenshot:", error);
-      window.alert("Could not add screenshot. Please try again.");
+      setScreenshotError("Could not add screenshot. Please try again.");
     } finally {
       setScreenshotActionId("");
     }
   };
 
   useEffect(() => {
-    if (
-      expandedScreenshot &&
-      !executionScreenshots.some(
-        (screenshot) => screenshot.id === expandedScreenshot,
-      )
-    ) {
-      setExpandedScreenshot(null);
+    if (!expandedScreenshot) return;
+    const ordered = orderScreenshotsByGroup(executionScreenshots);
+    const index = ordered.findIndex(
+      (screenshot) => screenshot.id === expandedScreenshot,
+    );
+    if (index >= 0) {
+      expandedScreenshotIndexRef.current = index;
+      return;
     }
+    // Deleting a frame removes its ID; stay on the neighbour that took its
+    // place instead of closing the review.
+    const fallback =
+      ordered[Math.min(expandedScreenshotIndexRef.current, ordered.length - 1)];
+    setExpandedScreenshot(fallback ? fallback.id : null);
+  }, [executionScreenshots, expandedScreenshot]);
+
+  useEffect(() => {
+    setIsScreenshotZoomed(false);
+    setExpandedScreenshotSize(null);
+  }, [expandedScreenshot]);
+
+  useEffect(() => {
+    if (!pendingDeleteScreenshot) return undefined;
+    const timeoutId = window.setTimeout(
+      () => setPendingDeleteScreenshot(""),
+      4000,
+    );
+    return () => window.clearTimeout(timeoutId);
+  }, [pendingDeleteScreenshot]);
+
+  useEffect(() => {
+    if (!expandedScreenshot) return undefined;
+    const handleKeyDown = (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      if (event.target.closest?.("input, textarea, select")) return;
+      const ordered = orderScreenshotsByGroup(executionScreenshots);
+      const index = ordered.findIndex(
+        (screenshot) => screenshot.id === expandedScreenshot,
+      );
+      const next = ordered[index + (event.key === "ArrowRight" ? 1 : -1)];
+      if (index < 0 || !next) return;
+      event.preventDefault();
+      setExpandedScreenshot(next.id);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [executionScreenshots, expandedScreenshot]);
 
   // Update descfile in args
@@ -3317,21 +3961,22 @@ function AudionutsUAGUI() {
     setCustomArgs((prev) => updateArgValue(prev, "--desclink", url));
   };
 
-  const appendHtmlFragment = (rawHtml) => {
-    const container = richOutputRef.current;
-    if (container) {
-      const wrapper = createUploadOutputFragment((rawHtml || "").trim());
-      container.appendChild(wrapper);
-      // Scroll only the terminal, including while its view is hidden.
-      setTimeout(() => {
-        container.scrollTop = container.scrollHeight;
-      }, 0);
-    }
+  const appendHtmlFragment = (rawHtml, tabId = activeTabIdRef.current) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
+    runtime.output.appendChild(
+      createUploadOutputFragment((rawHtml || "").trim()),
+    );
+    scrollTabOutput(tabId);
   };
 
-  const appendSystemMessage = (text, kind = "info") => {
-    const rootContainer = richOutputRef.current;
-    if (!rootContainer) return;
+  const appendSystemMessage = (
+    text,
+    kind = "info",
+    tabId = activeTabIdRef.current,
+  ) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
     const el = document.createElement("div");
     // Support multiple kinds: error, user-input, and default info
     if (kind === "error") el.className = "text-red-400";
@@ -3339,17 +3984,29 @@ function AudionutsUAGUI() {
     else el.className = "text-blue-300";
     el.style.whiteSpace = "pre-wrap";
     el.textContent = text;
-    rootContainer.appendChild(el);
-    // ensure fully visible
-    setTimeout(() => {
-      rootContainer.scrollTop = rootContainer.scrollHeight;
-    }, 0);
+    runtime.output.appendChild(el);
+    scrollTabOutput(tabId);
+  };
+
+  const appendWelcomeMessage = (tabId = activeTabIdRef.current) => {
+    appendSystemMessage("Upload-Assistant Interactive Output", "info", tabId);
+    appendSystemMessage(
+      '\nQuick Start:\n  1. Select a file or folder from the left panel\n  2. Add Upload-Assistant arguments (optional)\n  3. Click "Execute Upload" to start\n',
+      "info",
+      tabId,
+    );
   };
 
   const sendInput = async (session_id, input) => {
     if (isSendingInputRef.current || !session_id) return;
     isSendingInputRef.current = true;
     setIsSendingInput(true);
+    const tabId = activeTabIdRef.current;
+    const runtime = getTabRuntime(tabId);
+    if (runtime) {
+      runtime.awaiting = false;
+      refreshUploadTabStatus(tabId);
+    }
     // Optimistically echo the user's input locally so it appears before
     // any subsequent server-generated prompt / output.
     appendSystemMessage("> " + input, "user-input");
@@ -3371,10 +4028,11 @@ function AudionutsUAGUI() {
 
   // Initial welcome message in the rich output area
   useEffect(() => {
-    appendSystemMessage("Upload-Assistant Interactive Output");
-    appendSystemMessage(
-      '\nQuick Start:\n  1. Select a file or folder from the left panel\n  2. Add Upload-Assistant arguments (optional)\n  3. Click "Execute Upload" to start\n',
-    );
+    if (screenshotMode) {
+      appendHtmlFragment(screenshotMode.output);
+      return;
+    }
+    appendWelcomeMessage();
   }, []);
 
   const loadBrowseRoots = async () => {
@@ -3531,6 +4189,7 @@ function AudionutsUAGUI() {
   }, []);
 
   useEffect(() => {
+    if (screenshotMode) return;
     loadBrowseRoots();
 
     const loadTrackersData = async () => {
@@ -4655,60 +5314,410 @@ function AudionutsUAGUI() {
     });
   };
 
-  const executeSinglePath = async (path, newSessionId, itemArgs = "") => {
+  /** Show the server's label (e.g. "Title (2024)") and full release name for a tab. */
+  const setUploadTabTitle = (tabId, title, detail = "") => {
+    if (!title) return;
+    setUploadTabs((tabs) =>
+      tabs.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, title: String(title), detail: String(detail || "") }
+          : tab,
+      ),
+    );
+  };
+
+  /** Wait without blocking an abort of the tab's session. */
+  const waitForReconnect = (milliseconds, signal) =>
+    new Promise((resolve) => {
+      // An already-aborted signal never fires "abort" again.
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, milliseconds);
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+
+  /** Read one chunk, giving up on a connection that stopped sending keepalives. */
+  const readSessionChunk = (reader) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reader.cancel().catch(() => {});
+        reject(new Error("Session stream stalled"));
+      }, SESSION_STREAM_STALL_MS);
+      reader.read().then(
+        (chunk) => {
+          clearTimeout(timer);
+          resolve(chunk);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+
+  /**
+   * Apply one SSE response to a tab. Events before "replay_done" are history
+   * from the server's session log, so they do not replay prompt sounds.
+   */
+  const readSessionStream = async (tabId, response, controller) => {
+    const outcome = {
+      exitCode: null,
+      finished: false,
+      error: false,
+      started: false,
+    };
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return outcome;
+    let live = false;
+
+    const handleEvent = (data) => {
+      if (Number.isInteger(data.seq)) {
+        // Reconnects replay from the last sequence number; skip any overlap.
+        if (data.seq <= runtime.lastSeq) return;
+        runtime.lastSeq = data.seq;
+        outcome.started = true;
+      }
+      if (data.type === "html" || data.type === "html_full") {
+        try {
+          const clean = sanitizeHtml(data.data || "");
+          if (data.type === "html_full") {
+            const key = `${clean.length}:${clean.slice(0, 200)}`;
+            if (runtime.lastFullHash !== key) {
+              runtime.lastFullHash = key;
+              runtime.output.appendChild(createUploadOutputFragment(clean));
+              scrollTabOutput(tabId);
+            }
+            return;
+          }
+          appendHtmlFragment(clean, tabId);
+        } catch (e) {
+          console.error("Failed to render HTML fragment:", e);
+        }
+      } else if (data.type === "progress") {
+        applyProgressEvent(data.data || {}, tabId);
+      } else if (data.type === "prompt_sound") {
+        if (live) window.uaPromptSound?.play();
+      } else if (data.type === "prompt_state") {
+        runtime.awaiting = Boolean(data.awaiting);
+        refreshUploadTabStatus(tabId);
+      } else if (data.type === "replay_done") {
+        live = true;
+        outcome.started = true;
+      } else if (data.type === "label") {
+        setUploadTabTitle(tabId, data.label, data.detail);
+      } else if (data.type === "truncated") {
+        appendSystemMessage(
+          "Earlier output was trimmed on the server.",
+          "info",
+          tabId,
+        );
+      } else if (data.type === "error") {
+        outcome.error = true;
+        appendSystemMessage(`Error: ${data.data}`, "error", tabId);
+      } else if (data.type === "exit") {
+        appendSystemMessage("", "info", tabId);
+        appendSystemMessage(
+          `Success: Process exited with code ${data.code}`,
+          "info",
+          tabId,
+        );
+        outcome.exitCode = data.code;
+      } else if (data.type === "scheduled") {
+        outcome.scheduled = true;
+      } else if (data.type === "started") {
+        appendSystemMessage("Scheduled upload started.", "info", tabId);
+      } else if (data.type === "finished") {
+        outcome.finished = true;
+        if (outcome.exitCode === null && Number.isInteger(data.exit_code)) {
+          outcome.exitCode = data.exit_code;
+        }
+      }
+    };
+
+    const processSSELine = (line) => {
+      if (controller.signal.aborted) return;
+      if (!line.trim() || !line.startsWith("data: ")) return;
+      try {
+        handleEvent(JSON.parse(line.substring(6)));
+      } catch (e) {
+        console.error("Parse error:", e);
+      }
+    };
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    /* eslint-disable no-constant-condition */
+    while (true) {
+      const { done, value } = await readSessionChunk(reader);
+      if (done) {
+        if (buffer) buffer.split("\n").forEach(processSSELine);
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n");
+      buffer = parts.pop();
+      parts.forEach(processSSELine);
+      if (outcome.finished) {
+        // Release the connection now instead of waiting for garbage collection.
+        Promise.resolve(reader.cancel?.()).catch(() => {});
+        break;
+      }
+    }
+    /* eslint-enable no-constant-condition */
+    return outcome;
+  };
+
+  /**
+   * Follow a tab's session until the upload ends. A dropped connection only
+   * detaches the browser; the server keeps the upload running, so reconnect
+   * and replay whatever was missed.
+   */
+  const followSession = async (tabId, controller, firstResponse = null) => {
+    const { signal } = controller;
+    const result = { exitCode: null, error: false, lost: false };
+    let response = firstResponse;
+    let failures = 0;
+    for (;;) {
+      const runtime = getTabRuntime(tabId);
+      if (signal.aborted || !runtime) return { ...result, aborted: true };
+      if (response) {
+        let outcome = null;
+        try {
+          outcome = await readSessionStream(tabId, response, controller);
+        } catch (error) {
+          if (signal.aborted) return { ...result, aborted: true };
+        }
+        if (signal.aborted) return { ...result, aborted: true };
+        if (outcome) {
+          if (outcome.exitCode !== null) result.exitCode = outcome.exitCode;
+          if (outcome.error) result.error = true;
+          if (outcome.scheduled) return { ...result, scheduled: true };
+          if (outcome.finished || outcome.exitCode !== null) return result;
+          // Rejected before a session existed (limit, duplicate content, ...).
+          if (!outcome.started && outcome.error) return result;
+          if (outcome.started) failures = 0;
+        }
+      }
+
+      if (response || failures > 0) {
+        failures += 1;
+        if (failures > SESSION_RECONNECT_ATTEMPTS) {
+          result.lost = true;
+          appendSystemMessage(
+            "Error: Lost the connection to this upload. It keeps running on the server; reload the page to reattach.",
+            "error",
+            tabId,
+          );
+          return result;
+        }
+        if (failures === 1) {
+          appendSystemMessage(
+            "Connection lost; reconnecting to the upload...",
+            "info",
+            tabId,
+          );
+        }
+        await waitForReconnect(Math.min(10000, 1000 * failures), signal);
+        if (signal.aborted) return { ...result, aborted: true };
+      } else {
+        failures = 1;
+      }
+
+      response = null;
+      try {
+        const candidate = await apiFetch(
+          `${API_BASE}/session_stream?session_id=${encodeURIComponent(runtime.run.sessionId)}&after=${runtime.lastSeq}`,
+          { cache: "no-store", signal },
+        );
+        if (candidate.status === 404) {
+          result.lost = true;
+          appendSystemMessage(
+            "Error: This upload is no longer available on the server.",
+            "error",
+            tabId,
+          );
+          return result;
+        }
+        if (candidate.ok && candidate.body) response = candidate;
+      } catch (error) {
+        if (signal.aborted) return { ...result, aborted: true };
+      }
+    }
+  };
+
+  /** Fetch the session list at most once per poll interval, shared by all tabs. */
+  const pollSessionsShared = () => {
+    if (
+      sharedSessionsPoll.promise &&
+      Date.now() - sharedSessionsPoll.at < SCHEDULE_POLL_MS / 2
+    ) {
+      return sharedSessionsPoll.promise;
+    }
+    sharedSessionsPoll.at = Date.now();
+    sharedSessionsPoll.promise = apiFetch(`${API_BASE}/sessions`, {
+      cache: "no-store",
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .catch(() => null);
+    return sharedSessionsPoll.promise;
+  };
+
+  /**
+   * Poll the session list until a scheduled upload starts ("started"), is
+   * cancelled elsewhere ("gone"), or this tab stops waiting ("aborted").
+   */
+  const waitForScheduledStart = async (tabId, controller) => {
+    const { signal } = controller;
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return "aborted";
+    runtime.scheduled = true;
+    refreshUploadTabStatus(tabId);
+    try {
+      for (;;) {
+        await waitForReconnect(SCHEDULE_POLL_MS, signal);
+        if (signal.aborted || !getTabRuntime(tabId)) return "aborted";
+        const data = await pollSessionsShared();
+        if (signal.aborted) return "aborted";
+        if (!data || !Array.isArray(data.sessions)) continue;
+        const session = data.sessions.find(
+          (item) => item.session_id === runtime.run.sessionId,
+        );
+        if (!session) return "gone";
+        if (!session.scheduled) return "started";
+      }
+    } finally {
+      runtime.scheduled = false;
+      refreshUploadTabStatus(tabId);
+    }
+  };
+
+  /** Follow a session through an optional scheduled wait until it ends. */
+  const followScheduledSession = async (tabId, controller, result) => {
+    if (!result.scheduled) return result;
+    appendSystemMessage(
+      "All upload slots are busy. This upload is scheduled and starts automatically when one frees, even if you close the page.",
+      "info",
+      tabId,
+    );
+    const state = await waitForScheduledStart(tabId, controller);
+    if (state === "aborted") return { ...result, aborted: true };
+    if (state === "gone") {
+      appendSystemMessage("Scheduled upload was cancelled.", "error", tabId);
+      return { exitCode: null, error: true, lost: false };
+    }
+    return followSession(tabId, controller);
+  };
+
+  const finishTabSession = async (
+    tabId,
+    controller,
+    result,
+    { refreshFiles = false } = {},
+  ) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime || result.aborted || controller.signal.aborted) return false;
+    if (!result.lost && (result.exitCode !== null || !result.error)) {
+      appendSystemMessage("Success: Execution completed", "info", tabId);
+    }
+    appendSystemMessage("", "info", tabId);
+    if (refreshFiles && result.exitCode === 0) {
+      await refreshFileBrowserAfterUpload(controller.signal);
+    }
+    const succeeded =
+      !result.lost &&
+      (result.exitCode === 0 || (result.exitCode === null && !result.error));
+    runtime.result = succeeded ? "done" : "error";
+    return succeeded;
+  };
+
+  /** Forget this tab's finished server session so it is not restored again. */
+  const dismissTabSession = (tabId) => {
+    const runtime = getTabRuntime(tabId);
+    const sessionId = runtime?.sessionRecord;
+    if (!sessionId || runtime.run.isExecuting) return;
+    runtime.sessionRecord = "";
+    apiFetch(`${API_BASE}/session_dismiss`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    }).catch((error) => console.error("Failed to dismiss session:", error));
+  };
+
+  const executeSinglePath = async (
+    path,
+    newSessionId,
+    itemArgs = "",
+    tabId = activeTabIdRef.current,
+    label = "",
+  ) => {
     const executionArgs = [customArgs, itemArgs].filter(Boolean).join(" ");
+    const reportError = (message) => {
+      appendSystemMessage(message, "error", tabId);
+      return false;
+    };
     // Validate --descfile: must have a valid description file path
     if (hasDescFile) {
       if (!descFilePath) {
-        appendSystemMessage(
+        return reportError(
           "Error: Please select or enter a description file path when using --descfile",
-          "error",
         );
-        return false;
       }
       const pathValidation = isValidDescFilePath(descFilePath);
       if (!pathValidation.valid) {
-        appendSystemMessage(
+        return reportError(
           `Error: Invalid description file: ${pathValidation.error}`,
-          "error",
         );
-        return false;
       }
     }
 
     // Validate --desclink: must have a valid URL
     if (hasDescLink) {
       if (!descLinkUrl) {
-        appendSystemMessage(
+        return reportError(
           "Error: Please enter a description URL when using --desclink",
-          "error",
         );
-        return false;
       }
       if (!isValidUrl(descLinkUrl)) {
-        appendSystemMessage(
+        return reportError(
           "Error: Please enter a valid paste URL for --desclink (pastebin, hastebin, etc.)",
-          "error",
         );
-        return false;
       }
     }
 
-    setSessionId(newSessionId);
-    setProgressItems([]);
-    if (lastFullHashRef) lastFullHashRef.current = "";
+    const runtime = getTabRuntime(tabId);
+    // The tab was closed while its queue was being prepared.
+    if (!runtime) return false;
+    dismissTabSession(tabId);
+    runtime.lastFullHash = "";
+    runtime.lastSeq = 0;
+    runtime.awaiting = false;
+    runtime.waiting.clear();
+    runtime.result = "";
+    runtime.sessionRecord = newSessionId;
+    updateTabRun(tabId, { sessionId: newSessionId, progressItems: [] });
 
-    appendSystemMessage("");
-    appendSystemMessage(`$ python upload.py "${path}" ${executionArgs}`);
-    appendSystemMessage("Starting execution...");
+    appendSystemMessage("", "info", tabId);
+    appendSystemMessage(
+      `$ python upload.py "${path}" ${executionArgs}`,
+      "info",
+      tabId,
+    );
+    appendSystemMessage("Starting execution...", "info", tabId);
 
-    let localController = null;
+    const controller = new AbortController();
+    runtime.controller = controller;
 
     try {
-      const controller = new AbortController();
-      sseAbortControllerRef.current = controller;
-      localController = controller;
-
       const response = await apiFetch(`${API_BASE}/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4716,131 +5725,209 @@ function AudionutsUAGUI() {
           path: path,
           args: executionArgs,
           session_id: newSessionId,
+          label,
+          // The server starts it now, or schedules it if every slot is busy.
+          schedule: schedulingEnabled,
         }),
         signal: controller.signal,
       });
 
       if (!response.ok) {
         const errText = await response.text();
-        appendSystemMessage(
+        runtime.result = "error";
+        return reportError(
           `Error: Execute failed (${response.status}): ${errText || "Request failed"}`,
-          "error",
         );
-        return false;
       }
       if (!response.body) {
-        appendSystemMessage(
-          "Error: Execute failed: empty response body",
-          "error",
-        );
-        return false;
+        runtime.result = "error";
+        return reportError("Error: Execute failed: empty response body");
       }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let exitCode = null;
-
-      const processSSELine = (line) => {
-        if (localController && localController.signal.aborted) return;
-        if (!line.trim() || !line.startsWith("data: ")) return;
-        try {
-          const data = JSON.parse(line.substring(6));
-          if (data.type === "html" || data.type === "html_full") {
-            try {
-              const rawHtml = data.data || "";
-              const clean = sanitizeHtml(rawHtml);
-              const rootContainer = richOutputRef.current;
-              if (data.type === "html_full") {
-                const shortSample = clean.slice(0, 200);
-                const key = `${clean.length}:${shortSample}`;
-                if (lastFullHashRef.current !== key) {
-                  lastFullHashRef.current = key;
-                  const wrapper = createUploadOutputFragment(clean);
-                  if (rootContainer) rootContainer.appendChild(wrapper);
-                  setTimeout(() => {
-                    if (rootContainer)
-                      rootContainer.scrollTop = rootContainer.scrollHeight;
-                  }, 0);
-                }
-                return;
-              }
-              appendHtmlFragment(clean);
-            } catch (e) {
-              console.error("Failed to render HTML fragment:", e);
-            }
-          } else if (data.type === "progress") {
-            applyProgressEvent(data.data || {});
-          } else if (data.type === "prompt_sound") {
-            window.uaPromptSound?.play();
-          } else if (data.type === "exit") {
-            if (!(localController && localController.signal.aborted)) {
-              appendSystemMessage("");
-              appendSystemMessage(
-                `Success: Process exited with code ${data.code}`,
-              );
-              exitCode = data.code;
-            }
-          }
-        } catch (e) {
-          console.error("Parse error:", e);
-        }
-      };
-
-      /* eslint-disable no-constant-condition */
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          if (buffer) {
-            const finalLines = buffer.split("\n");
-            for (const line of finalLines) {
-              processSSELine(line);
-            }
-          }
-          break;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n");
-        buffer = parts.pop();
-
-        for (const line of parts) {
-          processSSELine(line);
-        }
-      }
-      /* eslint-enable no-constant-condition */
-
-      if (!(localController && localController.signal.aborted)) {
-        appendSystemMessage("Success: Execution completed");
-        appendSystemMessage("");
-        if (exitCode === 0) {
-          await refreshFileBrowserAfterUpload(localController.signal);
-        }
-        return exitCode === 0 || exitCode === null;
-      }
-      return false;
+      const result = await followScheduledSession(
+        tabId,
+        controller,
+        await followSession(tabId, controller, response),
+      );
+      return await finishTabSession(tabId, controller, result, {
+        refreshFiles: true,
+      });
     } catch (error) {
-      if (!(localController && localController.signal.aborted)) {
+      if (!controller.signal.aborted) {
+        runtime.result = "error";
         appendSystemMessage(
           "Error: Execution failed: " + error.message,
           "error",
+          tabId,
         );
       }
       return false;
     } finally {
-      setProgressItems([]);
-      try {
-        if (sseAbortControllerRef.current === localController) {
-          sseAbortControllerRef.current = null;
-        }
-      } catch (e) {
-        /* ignore */
-      }
+      runtime.awaiting = false;
+      runtime.waiting.clear();
+      if (runtime.controller === controller) runtime.controller = null;
+      updateTabRun(tabId, { progressItems: [] });
     }
   };
 
+  /** Show a server session in a tab and follow it until it ends. */
+  const attachRestoredSession = async (tabId) => {
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
+    const controller = new AbortController();
+    runtime.controller = controller;
+    try {
+      const result = runtime.scheduled
+        ? await followScheduledSession(tabId, controller, { scheduled: true })
+        : await followSession(tabId, controller);
+      await finishTabSession(tabId, controller, result);
+    } finally {
+      runtime.awaiting = false;
+      runtime.waiting.clear();
+      if (runtime.controller === controller) runtime.controller = null;
+      updateTabRun(tabId, {
+        isExecuting: false,
+        sessionId: "",
+        progressItems: [],
+      });
+    }
+  };
+
+  /**
+   * Recreate tabs for uploads still known to the server, plus forms this
+   * browser had prepared, so closing or reloading the page loses neither.
+   */
+  const restoreUploadSessions = async () => {
+    let sessions = [];
+    try {
+      const response = await apiFetch(`${API_BASE}/sessions`, {
+        cache: "no-store",
+      });
+      const data = await response.json();
+      if (response.ok && Array.isArray(data.sessions)) sessions = data.sessions;
+      if (Number.isInteger(data.max_running) && data.max_running > 0) {
+        setMaxRunningUploads(data.max_running);
+      }
+      if (typeof data.scheduling === "boolean") {
+        setSchedulingEnabled(data.scheduling);
+      }
+    } catch (error) {
+      console.error("Failed to load upload sessions:", error);
+    }
+    const drafts = loadUploadTabDrafts();
+
+    const firstTab = getTabRuntime("tab-1");
+    const replaceFirstTab =
+      firstTab &&
+      !firstTab.run.isExecuting &&
+      !firstTab.sessionRecord &&
+      !uploadTabFormHasContent({
+        selectedPath,
+        selectedPaths,
+        manualPathsText,
+        customArgs,
+      });
+    const room = MAX_UPLOAD_TABS - (replaceFirstTab ? 0 : 1);
+    const newTab = (runtime, title = "", detail = "") => {
+      uploadTabCounterRef.current += 1;
+      const number = uploadTabCounterRef.current;
+      const id = `tab-${number}`;
+      tabRuntimeRef.current.set(id, runtime);
+      return { id, number, title, detail, status: getUploadTabStatus(runtime) };
+    };
+    const restoredSessions = sessions.slice(0, room).map((session) => {
+      const runtime = createUploadTabRuntime();
+      runtime.run = {
+        sessionId: String(session.session_id),
+        isExecuting: Boolean(session.running),
+      };
+      runtime.sessionRecord = String(session.session_id);
+      runtime.scheduled = Boolean(session.scheduled);
+      runtime.awaiting = Boolean(session.awaiting_input);
+      if (!session.running)
+        runtime.result = session.exit_code === 0 ? "done" : "error";
+      return newTab(
+        runtime,
+        String(session.label || ""),
+        String(session.label_detail || ""),
+      );
+    });
+    const restoredDrafts = drafts
+      .slice(0, room - restoredSessions.length)
+      .map((draft) => {
+        const runtime = createUploadTabRuntime();
+        runtime.view.form = { ...createUploadTabForm(), ...draft.form };
+        return newTab(runtime);
+      });
+    const restored = [...restoredSessions, ...restoredDrafts];
+
+    if (restored.length && replaceFirstTab) {
+      switchUploadTab(restored[0].id);
+      tabRuntimeRef.current.delete("tab-1");
+      setUploadTabs(restored);
+    } else if (restored.length) {
+      setUploadTabs((tabs) => [...tabs, ...restored]);
+    }
+    // Run state must reach React for the visible tab; background tabs keep it in their runtime.
+    const visible = getTabRuntime(activeTabIdRef.current);
+    if (visible) {
+      setSessionId(visible.run.sessionId);
+      setIsExecuting(visible.run.isExecuting);
+    }
+    restoredSessions.forEach((tab) => attachRestoredSession(tab.id));
+    setUploadTabsRestored(true);
+  };
+
+  useEffect(() => {
+    if (screenshotMode) return;
+    restoreUploadSessions();
+  }, []);
+
+  useEffect(() => {
+    if (screenshotMode || !uploadTabsRestored) return;
+    const drafts = [];
+    uploadTabs.forEach((tab) => {
+      const runtime = getTabRuntime(tab.id);
+      // Running and finished tabs are restored from the server instead.
+      if (!runtime || runtime.run.isExecuting || runtime.sessionRecord) return;
+      const form =
+        tab.id === activeTabId
+          ? { selectedPath, selectedPaths, manualPathsText, customArgs }
+          : runtime.view.form;
+      if (!uploadTabFormHasContent(form)) return;
+      drafts.push({
+        form: {
+          selectedPath: form.selectedPath || "",
+          selectedPaths: form.selectedPaths || [],
+          manualPathsText: form.manualPathsText ?? null,
+          customArgs: form.customArgs || "",
+        },
+      });
+    });
+    saveUploadTabDrafts(drafts);
+  }, [
+    uploadTabsRestored,
+    uploadTabs,
+    activeTabId,
+    selectedPath,
+    selectedPaths,
+    manualPathsText,
+    customArgs,
+  ]);
+
+  const reportTabPathError = (tabId, message) => {
+    if (tabId === activeTabIdRef.current) {
+      setPathInputError(message);
+      return;
+    }
+    const runtime = getTabRuntime(tabId);
+    if (runtime) runtime.view.form.pathInputError = message;
+  };
+
   const executeCommand = async () => {
+    if (screenshotMode) return;
     window.uaPromptSound?.unlock();
     if (isExecuting) return;
+    const tabId = activeTabIdRef.current;
     const previousArgs = new Map(
       selectedPaths.map((item) => [item.path, item.args]),
     );
@@ -4863,7 +5950,14 @@ function AudionutsUAGUI() {
       return;
     }
     setPathInputError("");
-    setIsExecuting(true);
+    updateTabRun(tabId, { isExecuting: true });
+    setUploadTabs((tabs) =>
+      tabs.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, title: getUploadTabTitle(items), detail: "" }
+          : tab,
+      ),
+    );
     try {
       const response = await apiFetch(`${API_BASE}/save_queue`, {
         method: "POST",
@@ -4874,35 +5968,39 @@ function AudionutsUAGUI() {
       if (!response.ok || !data.success || !data.path) {
         const line = items[data.item - 1]?.line;
         const error = `${line ? `Line ${line}: ` : ""}${data.error || "Could not validate upload paths"}`;
-        setPathInputError(error);
+        reportTabPathError(tabId, error);
         return;
       }
-      const rootContainer = richOutputRef.current;
-      if (rootContainer) rootContainer.innerHTML = "";
+      const runtime = getTabRuntime(tabId);
+      if (!runtime) return;
+      runtime.output.replaceChildren();
       await executeSinglePath(
         data.path,
-        "session_" + Date.now(),
+        `session_${tabId}_${Date.now()}`,
         items.length === 1 ? items[0].args : "",
+        tabId,
+        getUploadTabTitle(items),
       );
     } catch (error) {
-      setPathInputError(`Could not prepare upload: ${error.message}`);
+      reportTabPathError(tabId, `Could not prepare upload: ${error.message}`);
     } finally {
-      setIsExecuting(false);
-      setSessionId("");
+      updateTabRun(tabId, { isExecuting: false, sessionId: "" });
     }
   };
 
   const clearTerminal = async () => {
+    if (screenshotMode) return;
+    const tabId = activeTabIdRef.current;
+    const runtime = getTabRuntime(tabId);
+    if (!runtime) return;
     // If a process is running, kill it first
     if (isExecuting && sessionId) {
       try {
         // Abort the SSE fetch so the client stops processing incoming events
-        if (sseAbortControllerRef.current) {
-          try {
-            sseAbortControllerRef.current.abort();
-          } catch (e) {
-            /* ignore */
-          }
+        try {
+          runtime.controller?.abort();
+        } catch (e) {
+          /* ignore */
         }
         await apiFetch(`${API_BASE}/kill`, {
           method: "POST",
@@ -4910,26 +6008,273 @@ function AudionutsUAGUI() {
           body: JSON.stringify({ session_id: sessionId }),
         });
 
-        appendSystemMessage("Error: Process terminated by user", "error");
+        appendSystemMessage(
+          "Error: Process terminated by user",
+          "error",
+          tabId,
+        );
 
-        setIsExecuting(false);
-        setSessionId("");
-        setProgressItems([]);
+        runtime.result = "";
+        updateTabRun(tabId, {
+          isExecuting: false,
+          sessionId: "",
+          progressItems: [],
+        });
       } catch (error) {
         console.error("Failed to kill process:", error);
       }
     }
 
-    // Clear the rich output container
-    const container = richOutputRef.current;
-    if (container) {
-      container.innerHTML = "";
-      setProgressItems([]);
-      appendSystemMessage("Upload-Assistant Interactive Output");
-      appendSystemMessage(
-        '\nQuick Start:\n  1. Select a file or folder from the left panel\n  2. Add Upload-Assistant arguments (optional)\n  3. Click "Execute Upload" to start\n',
-      );
+    dismissTabSession(tabId);
+
+    // Clear this tab's output
+    runtime.output.replaceChildren();
+    updateTabRun(tabId, { progressItems: [] });
+    appendWelcomeMessage(tabId);
+  };
+
+  /** Show another tab: park the current view state and restore the target's. */
+  const switchUploadTab = (nextId) => {
+    if (screenshotMode) return;
+    const currentId = activeTabIdRef.current;
+    const next = getTabRuntime(nextId);
+    if (nextId === currentId || !next) return;
+    const current = getTabRuntime(currentId);
+    if (current) {
+      current.view = {
+        isTerminalView,
+        progressItems,
+        form: {
+          selectedPath,
+          selectedPaths,
+          manualPathsText,
+          customArgs,
+          pathInputError,
+          selectedArgumentPreset,
+          userInput,
+        },
+      };
     }
+    activeTabIdRef.current = nextId;
+    const { form } = next.view;
+    setSessionId(next.run.sessionId);
+    setIsExecuting(next.run.isExecuting);
+    setIsTerminalView(next.view.isTerminalView);
+    setProgressItems(next.view.progressItems);
+    setSelectedPath(form.selectedPath);
+    setSelectedPaths(form.selectedPaths);
+    setManualPathsText(form.manualPathsText);
+    setCustomArgs(form.customArgs);
+    setPathInputError(form.pathInputError);
+    setSelectedArgumentPreset(form.selectedArgumentPreset);
+    setUserInput(form.userInput);
+    setActiveTabId(nextId);
+  };
+
+  /** Create an empty tab's runtime; the caller adds it to the tab bar. */
+  const createEmptyUploadTab = (number = null) => {
+    uploadTabCounterRef.current += 1;
+    const id = `tab-${uploadTabCounterRef.current}`;
+    tabRuntimeRef.current.set(id, createUploadTabRuntime());
+    appendWelcomeMessage(id);
+    return {
+      id,
+      number: number ?? uploadTabCounterRef.current,
+      title: "",
+      status: "idle",
+    };
+  };
+
+  const addUploadTab = () => {
+    if (screenshotMode || uploadTabs.length >= MAX_UPLOAD_TABS) return;
+    const tab = createEmptyUploadTab();
+    setUploadTabs((tabs) => [...tabs, tab]);
+    switchUploadTab(tab.id);
+  };
+
+  const closeUploadTab = async (tabId) => {
+    setPendingCloseTabId("");
+    const runtime = getTabRuntime(tabId);
+    const index = uploadTabs.findIndex((tab) => tab.id === tabId);
+    if (!runtime || index === -1) return;
+    if (!runtime.run.isExecuting) dismissTabSession(tabId);
+    if (uploadTabs.length <= 1) {
+      // The bar always keeps one tab, so "closing" the last one resets it.
+      const replacement = createEmptyUploadTab(uploadTabs[index].number);
+      switchUploadTab(replacement.id);
+      tabRuntimeRef.current.delete(tabId);
+      setUploadTabs([replacement]);
+    } else {
+      if (tabId === activeTabIdRef.current) {
+        const neighbor = uploadTabs[index + 1] || uploadTabs[index - 1];
+        switchUploadTab(neighbor.id);
+      }
+      tabRuntimeRef.current.delete(tabId);
+      setUploadTabs((tabs) => tabs.filter((tab) => tab.id !== tabId));
+    }
+    if (!runtime.run.isExecuting) return;
+    try {
+      runtime.controller?.abort();
+    } catch (e) {
+      /* ignore */
+    }
+    if (!runtime.run.sessionId) return;
+    try {
+      await apiFetch(`${API_BASE}/kill`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: runtime.run.sessionId }),
+      });
+    } catch (error) {
+      console.error("Failed to kill closed tab process:", error);
+    }
+  };
+
+  const requestCloseUploadTab = (tabId) => {
+    if (screenshotMode) return;
+    if (getTabRuntime(tabId)?.run.isExecuting) {
+      setPendingCloseTabId(tabId);
+      return;
+    }
+    closeUploadTab(tabId);
+  };
+
+  const getUploadTabLabel = (tab) => tab.title || `Upload ${tab.number}`;
+
+  const busyUploadCount = uploadTabs.filter((tab) =>
+    BUSY_UPLOAD_STATUSES.includes(tab.status),
+  ).length;
+  const uploadSlotsFull = busyUploadCount >= maxRunningUploads;
+  const activeTabScheduled =
+    uploadTabs.find((tab) => tab.id === activeTabId)?.status === "scheduled";
+  const executeDisabled =
+    (!selectedPath && selectedPaths.length === 0) ||
+    isExecuting ||
+    (uploadSlotsFull && !schedulingEnabled);
+  const executeButtonTitle = uploadSlotsFull
+    ? schedulingEnabled
+      ? `All ${maxRunningUploads} upload slots are busy; this upload starts automatically when one frees.`
+      : `All ${maxRunningUploads} upload slots are busy; wait for an upload to finish.`
+    : undefined;
+  const getExecuteButtonLabel = () => {
+    if (isExecuting) return activeTabScheduled ? "Scheduled" : "Executing...";
+    const noun = selectedPaths.length > 1 ? "Queue" : "Upload";
+    if (!uploadSlotsFull) return `Execute ${noun}`;
+    return schedulingEnabled ? `Schedule ${noun}` : "All upload slots busy";
+  };
+  const killButtonLabel = activeTabScheduled ? "Cancel" : "Kill";
+
+  const renderCloseUploadTabDialog = () => {
+    const tab = uploadTabs.find((item) => item.id === pendingCloseTabId);
+    if (!tab) return null;
+    const isLastTab = uploadTabs.length <= 1;
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ua-close-tab-title"
+        onClick={() => setPendingCloseTabId("")}
+      >
+        <div
+          className="ua-upload-tab-dialog w-full max-w-sm rounded-lg border p-5 shadow-xl"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <h2 id="ua-close-tab-title" className="text-base font-semibold">
+            Stop this upload?
+          </h2>
+          <p className="ua-upload-tab-dialog-text mt-2 text-sm">
+            &ldquo;{getUploadTabLabel(tab)}&rdquo; is still running.{" "}
+            {isLastTab
+              ? "Resetting the tab kills its process."
+              : "Closing the tab kills its process."}
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <button
+              onClick={() => setPendingCloseTabId("")}
+              className="ua-upload-tab-dialog-cancel rounded-md px-3 py-1.5 text-sm"
+              data-ua-modal-initial-focus
+            >
+              Keep running
+            </button>
+            <button
+              onClick={() => closeUploadTab(tab.id)}
+              className="rounded-md bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
+            >
+              {isLastTab ? "Kill and reset" : "Kill and close"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderUploadTabs = () => {
+    const canAddTab = uploadTabs.length < MAX_UPLOAD_TABS;
+    return (
+      <>
+        <div className="ua-upload-tabs" role="tablist" aria-label="Uploads">
+          {uploadTabs.map((tab) => {
+            const isActive = tab.id === activeTabId;
+            const label = getUploadTabLabel(tab);
+            const statusLabel = UPLOAD_TAB_STATUS_LABELS[tab.status] || "";
+            return (
+              <div
+                key={tab.id}
+                className="ua-upload-tab"
+                data-active={isActive ? "true" : "false"}
+              >
+                <button
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => switchUploadTab(tab.id)}
+                  className="ua-upload-tab-button"
+                  title={[label, tab.detail, statusLabel]
+                    .filter(Boolean)
+                    .join("\n")}
+                >
+                  <span
+                    className="ua-upload-tab-dot"
+                    data-status={tab.status}
+                    role="img"
+                    aria-label={statusLabel}
+                  />
+                  <span className="ua-upload-tab-label">{label}</span>
+                </button>
+                <button
+                  onClick={() => requestCloseUploadTab(tab.id)}
+                  className="ua-upload-tab-close"
+                  aria-label={
+                    uploadTabs.length > 1 ? `Close ${label}` : `Reset ${label}`
+                  }
+                  title={
+                    uploadTabs.length > 1
+                      ? "Close tab"
+                      : "Reset tab (kills a running upload)"
+                  }
+                >
+                  <LucideIcon name="x" className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            );
+          })}
+          <button
+            onClick={addUploadTab}
+            disabled={!canAddTab}
+            className="ua-upload-tab-add"
+            aria-label="New upload tab"
+            title={
+              canAddTab
+                ? "New upload tab"
+                : `Up to ${MAX_UPLOAD_TABS} upload tabs`
+            }
+          >
+            <LucideIcon name="plus" className="h-4 w-4" />
+          </button>
+        </div>
+        {renderCloseUploadTabDialog()}
+      </>
+    );
   };
 
   // Sidebar resizing
@@ -4944,9 +6289,11 @@ function AudionutsUAGUI() {
   const resize = useCallback(
     (e) => {
       const requestedWidth = e.clientX - APPLICATION_RAIL_WIDTH;
-      const newWidth = Math.min(
-        LEFT_SIDEBAR_MAX_WIDTH,
-        Math.max(DEFAULT_LEFT_SIDEBAR_WIDTH, requestedWidth),
+      const newWidth = snapToDevicePixels(
+        Math.min(
+          LEFT_SIDEBAR_MAX_WIDTH,
+          Math.max(DEFAULT_LEFT_SIDEBAR_WIDTH, requestedWidth),
+        ),
       );
       setSidebarWidth(newWidth);
       storage.set(LEFT_SIDEBAR_WIDTH_KEY, String(newWidth));
@@ -4978,9 +6325,11 @@ function AudionutsUAGUI() {
     (e) => {
       // Calculate width from right edge
       const requestedWidth = window.innerWidth - e.clientX;
-      const newWidth = Math.min(
-        RIGHT_SIDEBAR_MAX_WIDTH,
-        Math.max(DEFAULT_RIGHT_SIDEBAR_WIDTH, requestedWidth),
+      const newWidth = snapToDevicePixels(
+        Math.min(
+          RIGHT_SIDEBAR_MAX_WIDTH,
+          Math.max(DEFAULT_RIGHT_SIDEBAR_WIDTH, requestedWidth),
+        ),
       );
       setRightSidebarWidth(newWidth);
       storage.set(RIGHT_SIDEBAR_WIDTH_KEY, String(newWidth));
@@ -5285,23 +6634,31 @@ function AudionutsUAGUI() {
   };
 
   const renderDescriptionPanel = () => {
+    const isSplitView = expandedReviewPanel === "description";
+    const showEditor = isSplitView || descriptionView === "edit";
+    const showPreview = isSplitView || descriptionView === "preview";
     const sources = Array.isArray(executionDescription?.sources)
       ? executionDescription.sources
       : [];
     return (
       <div className="flex h-full flex-col">
         <div className="ua-upload-panel-header border-b p-3">
-          <h2
-            className={`text-base font-bold ${isDarkMode ? "text-white" : "text-gray-800"}`}
-          >
-            Description review
-          </h2>
-          <p
-            className={`mt-1 text-xs ${isDarkMode ? "text-gray-400" : "text-gray-600"}`}
-          >
-            Edit the base description before tracker-specific formatting is
-            applied.
-          </p>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2
+                className={`text-base font-bold ${isDarkMode ? "text-white" : "text-gray-800"}`}
+              >
+                Description review
+              </h2>
+              <p
+                className={`mt-1 text-xs ${isDarkMode ? "text-gray-400" : "text-gray-600"}`}
+              >
+                Edit the base description before tracker-specific formatting is
+                applied.
+              </p>
+            </div>
+            {renderReviewExpandButton("description")}
+          </div>
         </div>
         <div className="flex flex-1 min-h-0 flex-col gap-3 overflow-hidden p-3">
           <section
@@ -5339,7 +6696,7 @@ function AudionutsUAGUI() {
           <section className="flex min-h-[24rem] flex-1 flex-col">
             <div className="mb-2 flex items-center justify-between gap-3">
               <div
-                className={`inline-flex rounded-md p-1 ${isDarkMode ? "bg-gray-800" : "bg-gray-100"}`}
+                className={`inline-flex rounded-md p-1 ${isSplitView ? "invisible" : ""} ${isDarkMode ? "bg-gray-800" : "bg-gray-100"}`}
               >
                 {["edit", "preview"].map((view) => (
                   <button
@@ -5352,7 +6709,7 @@ function AudionutsUAGUI() {
                   </button>
                 ))}
               </div>
-              {descriptionView === "preview" && (
+              {showPreview && (
                 <span
                   className={`text-right text-xs ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
                 >
@@ -5361,68 +6718,77 @@ function AudionutsUAGUI() {
                 </span>
               )}
             </div>
-            {descriptionView === "edit" ? (
-              <>
-                <div
-                  role="toolbar"
-                  aria-label="Description formatting"
-                  className={`mb-2 flex flex-wrap gap-1 rounded-lg border p-1.5 ${isDarkMode ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`}
-                >
-                  {[
-                    ["Bold", "B", "[b]", "[/b]"],
-                    ["Italic", "I", "[i]", "[/i]"],
-                    ["Underline", "U", "[u]", "[/u]"],
-                    ["Strikethrough", "S", "[s]", "[/s]"],
-                    ["Code", "Code", "[code]", "[/code]"],
-                    ["Quote", "Quote", "[quote]", "[/quote]"],
-                    ["Spoiler", "Spoiler", "[spoiler]", "[/spoiler]"],
-                    ["Align left", "Left", "[left]", "[/left]"],
-                    ["Align center", "Center", "[center]", "[/center]"],
-                    ["Align right", "Right", "[right]", "[/right]"],
-                  ].map(([label, text, openingTag, closingTag]) => (
-                    <button
-                      key={label}
-                      type="button"
-                      title={label}
-                      aria-label={label}
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={() =>
-                        applyDescriptionBbcode(openingTag, closingTag)
-                      }
-                      className={`ua-accent-hover rounded px-2 py-1 text-xs font-semibold ${isDarkMode ? "text-gray-200" : "text-gray-700"}`}
-                    >
-                      {text}
-                    </button>
-                  ))}
+            <div
+              className={
+                isSplitView
+                  ? "grid min-h-0 flex-1 grid-cols-2 gap-3"
+                  : "flex min-h-0 flex-1 flex-col"
+              }
+            >
+              {showEditor && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <div
+                    role="toolbar"
+                    aria-label="Description formatting"
+                    className={`mb-2 flex flex-wrap gap-1 rounded-lg border p-1.5 ${isDarkMode ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`}
+                  >
+                    {[
+                      ["Bold", "B", "[b]", "[/b]"],
+                      ["Italic", "I", "[i]", "[/i]"],
+                      ["Underline", "U", "[u]", "[/u]"],
+                      ["Strikethrough", "S", "[s]", "[/s]"],
+                      ["Code", "Code", "[code]", "[/code]"],
+                      ["Quote", "Quote", "[quote]", "[/quote]"],
+                      ["Spoiler", "Spoiler", "[spoiler]", "[/spoiler]"],
+                      ["Align left", "Left", "[left]", "[/left]"],
+                      ["Align center", "Center", "[center]", "[/center]"],
+                      ["Align right", "Right", "[right]", "[/right]"],
+                    ].map(([label, text, openingTag, closingTag]) => (
+                      <button
+                        key={label}
+                        type="button"
+                        title={label}
+                        aria-label={label}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() =>
+                          applyDescriptionBbcode(openingTag, closingTag)
+                        }
+                        className={`ua-accent-hover rounded px-2 py-1 text-xs font-semibold ${isDarkMode ? "text-gray-200" : "text-gray-700"}`}
+                      >
+                        {text}
+                      </button>
+                    ))}
+                  </div>
+                  <textarea
+                    ref={descriptionEditorRef}
+                    value={descriptionDraft}
+                    onChange={(event) => {
+                      descriptionVersionRef.current = Math.max(
+                        descriptionVersionRef.current,
+                        descriptionVersion,
+                      );
+                      setDescriptionDraft(event.target.value);
+                      setDescriptionDirty(true);
+                    }}
+                    onBlur={() => {
+                      if (descriptionDirty) saveExecutionDescription();
+                    }}
+                    spellCheck={false}
+                    aria-label="Base description"
+                    className={`min-h-[20rem] flex-1 resize-y rounded-lg border p-3 font-mono text-xs leading-5 ${isDarkMode ? "border-gray-700 bg-gray-950 text-gray-100" : "border-gray-300 bg-white text-gray-800"}`}
+                    placeholder="The editable base description will appear here."
+                  />
                 </div>
-                <textarea
-                  ref={descriptionEditorRef}
-                  value={descriptionDraft}
-                  onChange={(event) => {
-                    descriptionVersionRef.current = Math.max(
-                      descriptionVersionRef.current,
-                      descriptionVersion,
-                    );
-                    setDescriptionDraft(event.target.value);
-                    setDescriptionDirty(true);
+              )}
+              {showPreview && (
+                <div
+                  className={`bbcode-preview min-h-[20rem] flex-1 overflow-auto whitespace-pre-wrap rounded-lg border p-3 text-sm leading-6 [&_a]:text-sky-400 [&_a]:underline [&_blockquote]:my-3 [&_blockquote]:border-l-4 [&_blockquote]:pl-3 [&_details]:my-3 [&_img]:my-3 [&_img]:max-w-full [&_img]:rounded [&_pre]:overflow-auto [&_pre]:font-mono [&_table]:my-3 [&_table]:border-collapse [&_td]:border [&_td]:p-2 [&_th]:border [&_th]:p-2 ${isDarkMode ? "border-gray-700 bg-gray-950 text-gray-100 [&_td]:border-gray-700 [&_th]:border-gray-700" : "border-gray-300 bg-white text-gray-800 [&_td]:border-gray-300 [&_th]:border-gray-300"}`}
+                  dangerouslySetInnerHTML={{
+                    __html: renderBbcodePreview(descriptionDraft),
                   }}
-                  onBlur={() => {
-                    if (descriptionDirty) saveExecutionDescription();
-                  }}
-                  spellCheck={false}
-                  aria-label="Base description"
-                  className={`min-h-[20rem] flex-1 resize-y rounded-lg border p-3 font-mono text-xs leading-5 ${isDarkMode ? "border-gray-700 bg-gray-950 text-gray-100" : "border-gray-300 bg-white text-gray-800"}`}
-                  placeholder="The editable base description will appear here."
                 />
-              </>
-            ) : (
-              <div
-                className={`bbcode-preview min-h-[20rem] flex-1 overflow-auto whitespace-pre-wrap rounded-lg border p-3 text-sm leading-6 [&_a]:text-sky-400 [&_a]:underline [&_blockquote]:my-3 [&_blockquote]:border-l-4 [&_blockquote]:pl-3 [&_details]:my-3 [&_img]:my-3 [&_img]:max-w-full [&_img]:rounded [&_pre]:overflow-auto [&_pre]:font-mono [&_table]:my-3 [&_table]:border-collapse [&_td]:border [&_td]:p-2 [&_th]:border [&_th]:p-2 ${isDarkMode ? "border-gray-700 bg-gray-950 text-gray-100 [&_td]:border-gray-700 [&_th]:border-gray-700" : "border-gray-300 bg-white text-gray-800 [&_td]:border-gray-300 [&_th]:border-gray-300"}`}
-                dangerouslySetInnerHTML={{
-                  __html: renderBbcodePreview(descriptionDraft),
-                }}
-              />
-            )}
+              )}
+            </div>
             <div className="mt-2 flex items-center justify-between gap-3">
               <span
                 className={`text-xs ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
@@ -5444,6 +6810,87 @@ function AudionutsUAGUI() {
     );
   };
 
+  const renderMediaInfoPanel = () => {
+    const reports = Array.isArray(executionMediaInfo?.reports)
+      ? executionMediaInfo.reports
+      : [];
+    const selectedReport =
+      reports.find((report) => report.key === selectedMediaInfoKey) ||
+      reports[0];
+    const emptyMessage =
+      mediaInfoStatus === "error"
+        ? "Could not load the report. Retrying…"
+        : mediaInfoStatus === "pending"
+          ? "The report has not been generated yet."
+          : "Loading…";
+    return (
+      <div className="flex h-full flex-col">
+        <div className="ua-upload-panel-header border-b p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2
+                className={`text-base font-bold ${isDarkMode ? "text-white" : "text-gray-800"}`}
+              >
+                {mediaInfoLabel}
+              </h2>
+              <p
+                className={`mt-1 text-xs ${isDarkMode ? "text-gray-400" : "text-gray-600"}`}
+              >
+                Read-only report generated for the current release.
+              </p>
+            </div>
+            {renderReviewExpandButton("mediainfo")}
+          </div>
+        </div>
+        <div className="flex flex-1 min-h-0 flex-col gap-3 overflow-hidden p-3">
+          {reports.length > 1 && (
+            <div className="overflow-x-auto pb-1">
+              <div
+                className={`inline-flex w-max rounded-md p-1 ${isDarkMode ? "bg-gray-800" : "bg-gray-100"}`}
+              >
+                {reports.map((report) => (
+                  <button
+                    key={report.key}
+                    onClick={() => setSelectedMediaInfoKey(report.key)}
+                    aria-pressed={selectedReport?.key === report.key}
+                    className={`whitespace-nowrap rounded px-3 py-1 text-xs font-semibold ${selectedReport?.key === report.key ? "ua-accent-action" : isDarkMode ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-white"}`}
+                  >
+                    {report.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {selectedReport ? (
+            <>
+              <pre
+                aria-label={`${selectedReport.label} report`}
+                className={`min-h-[20rem] flex-1 overflow-auto whitespace-pre rounded-lg border p-3 font-mono text-xs leading-5 ${isDarkMode ? "border-gray-700 bg-gray-950 text-gray-100" : "border-gray-300 bg-white text-gray-800"}`}
+              >
+                {selectedReport.content}
+              </pre>
+              <div className="flex items-center justify-between gap-3">
+                <span
+                  className={`text-xs ${isDarkMode ? "text-gray-400" : "text-gray-500"}`}
+                >
+                  {selectedReport.content.length.toLocaleString()} characters
+                </span>
+                <button
+                  onClick={() => copyMediaInfoReport(selectedReport.content)}
+                  className="ua-accent-action rounded-md px-3 py-1.5 text-xs font-semibold"
+                >
+                  {mediaInfoCopied ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-gray-500">{emptyMessage}</p>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const renderScreenshotsPanel = () => {
     const isWorking = Boolean(screenshotActionId);
     const expandedItem = executionScreenshots.find(
@@ -5457,6 +6904,95 @@ function AudionutsUAGUI() {
       },
       {},
     );
+    const orderedScreenshots = orderScreenshotsByGroup(executionScreenshots);
+    const expandedIndex = expandedItem
+      ? orderedScreenshots.findIndex(
+          (screenshot) => screenshot.id === expandedItem.id,
+        )
+      : -1;
+    const previousScreenshot =
+      expandedIndex > 0 ? orderedScreenshots[expandedIndex - 1] : null;
+    const nextScreenshot =
+      expandedIndex >= 0 ? orderedScreenshots[expandedIndex + 1] : null;
+    const isGeneratingFrame =
+      screenshotActionId === "add" || screenshotActionId.startsWith("replace:");
+    const screenshotStateLabel = {
+      remote: "Remote",
+      replacement: "Replacement",
+      addition: "Added",
+    };
+    const renderScreenshotActions = (screenshot, inLightbox = false) => {
+      const replacing = screenshotActionId === `replace:${screenshot.id}`;
+      const deleting = screenshotActionId === `delete:${screenshot.id}`;
+      const undoing = screenshotActionId === `undo:${screenshot.id}`;
+      const confirmingDelete = pendingDeleteScreenshot === screenshot.id;
+      const neutralButtonClass = inLightbox
+        ? "bg-white/10 text-gray-100 hover:bg-white/20"
+        : isDarkMode
+          ? "bg-gray-700 text-gray-100 hover:bg-gray-600"
+          : "bg-gray-100 text-gray-700 hover:bg-gray-200";
+      return (
+        <>
+          {screenshot.can_replace && (
+            <button
+              type="button"
+              onClick={() =>
+                changeExecutionScreenshot(screenshot.id, "replace")
+              }
+              disabled={isWorking}
+              className="ua-accent-action px-2 py-1 text-xs rounded-md disabled:opacity-50"
+            >
+              {replacing ? "Generating…" : "Replace"}
+            </button>
+          )}
+          {screenshot.source === "replacement" && (
+            <button
+              type="button"
+              onClick={() => changeExecutionScreenshot(screenshot.id, "undo")}
+              disabled={isWorking}
+              className={`px-2 py-1 text-xs rounded-md disabled:opacity-50 ${neutralButtonClass}`}
+              title="Restore the original remote screenshot"
+              aria-label="Restore the original remote screenshot"
+            >
+              {undoing ? "Restoring…" : "Undo"}
+            </button>
+          )}
+          {screenshot.can_delete && (
+            <button
+              type="button"
+              onClick={() => {
+                if (confirmingDelete) {
+                  setPendingDeleteScreenshot("");
+                  changeExecutionScreenshot(screenshot.id, "delete");
+                } else {
+                  setPendingDeleteScreenshot(screenshot.id);
+                }
+              }}
+              disabled={isWorking}
+              className={`rounded-md disabled:opacity-50 ${confirmingDelete ? "bg-rose-600 px-2 py-1 text-xs font-semibold text-white hover:bg-rose-700" : `p-1.5 text-rose-500 ${inLightbox ? "hover:bg-white/10" : "hover:bg-rose-50 dark:hover:bg-rose-950/40"}`}`}
+              title={
+                confirmingDelete
+                  ? "Click again to delete"
+                  : `Delete ${screenshot.filename}`
+              }
+              aria-label={
+                confirmingDelete
+                  ? `Confirm deleting ${screenshot.filename}`
+                  : `Delete ${screenshot.filename}`
+              }
+            >
+              {deleting ? (
+                <SpinnerIcon />
+              ) : confirmingDelete ? (
+                "Confirm delete"
+              ) : (
+                <TrashIcon />
+              )}
+            </button>
+          )}
+        </>
+      );
+    };
     const screenshotGroupLabel = (group) => {
       if (group === "main") return "Main";
       return group.startsWith("PLAYLIST_")
@@ -5483,6 +7019,15 @@ function AudionutsUAGUI() {
                   Review frames before image hosting. Replacements use a
                   different point in the video.
                 </p>
+                {isGeneratingFrame && (
+                  <p
+                    className={`mt-1 flex items-center gap-1.5 text-xs font-semibold ${isDarkMode ? "text-gray-200" : "text-gray-700"}`}
+                    role="status"
+                  >
+                    <SpinnerIcon />
+                    Generating a new frame…
+                  </p>
+                )}
               </div>
               <button
                 onClick={() => addExecutionScreenshot("main")}
@@ -5493,9 +7038,25 @@ function AudionutsUAGUI() {
               >
                 {screenshotActionId === "add" ? <SpinnerIcon /> : <PlusIcon />}
               </button>
+              {renderReviewExpandButton("screenshots")}
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-3">
+            {screenshotError && (
+              <div
+                className="mb-3 flex items-start justify-between gap-3 rounded-lg bg-rose-600 px-3 py-2 text-xs text-white"
+                role="alert"
+              >
+                <span>{screenshotError}</span>
+                <button
+                  type="button"
+                  onClick={() => setScreenshotError("")}
+                  className="font-semibold underline"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             {executionScreenshots.length === 0 ? (
               <div
                 className={`rounded-lg border p-5 text-center text-sm ${isDarkMode ? "border-gray-700 bg-gray-800 text-gray-400" : "border-gray-200 bg-gray-50 text-gray-500"}`}
@@ -5529,18 +7090,8 @@ function AudionutsUAGUI() {
                         {screenshots.map((screenshot, index) => {
                           const replacing =
                             screenshotActionId === `replace:${screenshot.id}`;
-                          const deleting =
-                            screenshotActionId === `delete:${screenshot.id}`;
-                          const undoing =
-                            screenshotActionId === `undo:${screenshot.id}`;
                           const screenshotState =
-                            screenshot.source === "remote"
-                              ? "Remote"
-                              : screenshot.source === "replacement"
-                                ? "Pending upload"
-                                : screenshot.source === "addition"
-                                  ? "Pending upload"
-                                  : "Local";
+                            screenshotStateLabel[screenshot.source] || "Local";
                           const screenshotStateClass =
                             screenshot.source === "remote"
                               ? isDarkMode
@@ -5562,12 +7113,21 @@ function AudionutsUAGUI() {
                               key={screenshot.id}
                               className={`rounded-xl overflow-hidden border ${isDarkMode ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}`}
                             >
-                              <img
-                                src={screenshot.image_url}
-                                alt={`Screenshot ${index + 1}`}
-                                className={`w-full aspect-video object-contain bg-black transition-all duration-300 ${replacing ? "opacity-35 brightness-50" : "opacity-100 brightness-100"}`}
-                                loading="lazy"
-                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedScreenshot(screenshot.id)
+                                }
+                                className="block w-full cursor-zoom-in"
+                                aria-label={`Expand ${screenshot.filename}`}
+                              >
+                                <img
+                                  src={screenshot.image_url}
+                                  alt={`Screenshot ${index + 1}`}
+                                  className={`w-full aspect-video object-contain bg-black transition-all duration-300 ${replacing ? "opacity-35 brightness-50" : "opacity-100 brightness-100"}`}
+                                  loading="lazy"
+                                />
+                              </button>
                               <div className="p-2.5 flex items-center justify-between gap-2">
                                 <div className="min-w-0 flex-1">
                                   <span
@@ -5580,68 +7140,24 @@ function AudionutsUAGUI() {
                                     title={screenshot.filename}
                                   >
                                     {screenshot.filename}
+                                    {screenshot.size
+                                      ? ` · ${formatSize(screenshot.size)}`
+                                      : ""}
                                   </span>
                                 </div>
                                 <div className="flex gap-1.5 flex-shrink-0">
-                                  {screenshot.can_replace && (
-                                    <button
-                                      onClick={() =>
-                                        changeExecutionScreenshot(
-                                          screenshot.id,
-                                          "replace",
-                                        )
-                                      }
-                                      disabled={isWorking}
-                                      className="ua-accent-action px-2 py-1 text-xs rounded-md disabled:opacity-50"
-                                    >
-                                      {replacing ? "Generating…" : "Replace"}
-                                    </button>
-                                  )}
+                                  {renderScreenshotActions(screenshot)}
                                   <button
+                                    type="button"
                                     onClick={() =>
                                       setExpandedScreenshot(screenshot.id)
                                     }
-                                    disabled={isWorking}
-                                    className={`p-1.5 rounded-md disabled:opacity-50 ${isDarkMode ? "text-gray-200 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-100"}`}
+                                    className={`p-1.5 rounded-md ${isDarkMode ? "text-gray-200 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-100"}`}
                                     title={`Expand ${screenshot.filename}`}
                                     aria-label={`Expand ${screenshot.filename}`}
                                   >
                                     <ExpandIcon />
                                   </button>
-                                  {screenshot.can_delete && (
-                                    <button
-                                      onClick={() =>
-                                        changeExecutionScreenshot(
-                                          screenshot.id,
-                                          "delete",
-                                        )
-                                      }
-                                      disabled={isWorking}
-                                      className="p-1.5 rounded-md text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-50"
-                                      title={`Delete ${screenshot.filename}`}
-                                    >
-                                      {deleting ? (
-                                        <SpinnerIcon />
-                                      ) : (
-                                        <TrashIcon />
-                                      )}
-                                    </button>
-                                  )}
-                                  {screenshot.source === "replacement" && (
-                                    <button
-                                      onClick={() =>
-                                        changeExecutionScreenshot(
-                                          screenshot.id,
-                                          "undo",
-                                        )
-                                      }
-                                      disabled={isWorking}
-                                      className={`px-2 py-1 text-xs rounded-md disabled:opacity-50 ${isDarkMode ? "bg-gray-700 text-gray-100 hover:bg-gray-600" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`}
-                                      title="Restore the original remote screenshot"
-                                    >
-                                      {undoing ? "Restoring…" : "Undo"}
-                                    </button>
-                                  )}
                                 </div>
                               </div>
                             </article>
@@ -5658,29 +7174,111 @@ function AudionutsUAGUI() {
         {expandedItem && (
           <div
             ref={screenshotModalRef}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
+            className="fixed inset-0 z-50 flex flex-col bg-black/90"
             role="dialog"
             aria-modal="true"
             aria-label={`Expanded ${expandedItem.filename}`}
             tabIndex="-1"
-            onClick={() => setExpandedScreenshot(null)}
           >
-            <div
-              className="relative max-h-full max-w-full"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <button
-                onClick={() => setExpandedScreenshot(null)}
-                className="absolute right-2 top-2 z-10 rounded-md bg-black/70 px-3 py-1.5 text-sm text-white hover:bg-black"
-                data-ua-modal-initial-focus
+            <div className="flex flex-none flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 text-sm text-gray-100">
+              <span className="font-semibold tabular-nums">
+                {expandedIndex + 1} / {orderedScreenshots.length}
+              </span>
+              <span className="min-w-0 truncate font-mono text-xs text-gray-300">
+                {expandedItem.filename}
+              </span>
+              <span className="text-xs text-gray-400 tabular-nums">
+                {[
+                  expandedScreenshotSize
+                    ? `${expandedScreenshotSize.width}×${expandedScreenshotSize.height}`
+                    : "",
+                  expandedItem.size ? formatSize(expandedItem.size) : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                {renderScreenshotActions(expandedItem, true)}
+                <button
+                  type="button"
+                  onClick={() => setIsScreenshotZoomed((zoomed) => !zoomed)}
+                  aria-pressed={isScreenshotZoomed}
+                  className="rounded-md bg-white/10 px-2 py-1 text-xs text-gray-100 hover:bg-white/20"
+                  title={
+                    isScreenshotZoomed
+                      ? "Fit the image to the window"
+                      : "Show at full size"
+                  }
+                >
+                  {isScreenshotZoomed ? "Fit" : "100%"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExpandedScreenshot(null)}
+                  className="rounded-md bg-white/10 px-3 py-1 text-xs text-gray-100 hover:bg-white/20"
+                  data-ua-modal-initial-focus
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            {screenshotError && (
+              <div
+                className="mx-4 mb-2 flex-none rounded-md bg-rose-600 px-3 py-1.5 text-xs text-white"
+                role="alert"
               >
-                Close
-              </button>
-              <img
-                src={expandedItem.image_url}
-                alt={expandedItem.filename}
-                className="max-h-[90vh] max-w-[92vw] object-contain"
-              />
+                {screenshotError}
+              </div>
+            )}
+            <div className="relative flex min-h-0 flex-1">
+              <div
+                className={`h-full w-full ${isScreenshotZoomed ? "overflow-auto" : "flex items-center justify-center p-4"}`}
+                onClick={(event) => {
+                  if (event.target === event.currentTarget) {
+                    setExpandedScreenshot(null);
+                  }
+                }}
+              >
+                <img
+                  key={expandedItem.full_image_url || expandedItem.image_url}
+                  src={expandedItem.full_image_url || expandedItem.image_url}
+                  alt={expandedItem.filename}
+                  onLoad={(event) =>
+                    setExpandedScreenshotSize({
+                      width: event.currentTarget.naturalWidth,
+                      height: event.currentTarget.naturalHeight,
+                    })
+                  }
+                  onClick={() => setIsScreenshotZoomed((zoomed) => !zoomed)}
+                  className={
+                    isScreenshotZoomed
+                      ? "m-auto block max-w-none cursor-zoom-out"
+                      : "max-h-full max-w-full cursor-zoom-in object-contain"
+                  }
+                />
+              </div>
+              {previousScreenshot && (
+                <button
+                  type="button"
+                  onClick={() => setExpandedScreenshot(previousScreenshot.id)}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 rounded-full bg-black/60 p-2 text-white hover:bg-black"
+                  title="Previous screenshot (←)"
+                  aria-label="Previous screenshot"
+                >
+                  <LucideIcon name="chevron-left" className="h-6 w-6" />
+                </button>
+              )}
+              {nextScreenshot && (
+                <button
+                  type="button"
+                  onClick={() => setExpandedScreenshot(nextScreenshot.id)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-black/60 p-2 text-white hover:bg-black"
+                  title="Next screenshot (→)"
+                  aria-label="Next screenshot"
+                >
+                  <LucideIcon name="chevron-right" className="h-6 w-6" />
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -6231,6 +7829,19 @@ function AudionutsUAGUI() {
         className={`ua-upload-page flex flex-col h-screen ${isDarkMode ? "bg-gray-900" : "bg-gray-50"}`}
         data-mode={isDarkMode ? "dark" : "light"}
       >
+        {screenshotMode && (
+          <ScreenshotModeControls
+            onPoster={(poster) =>
+              setExecutionPreview((media) => ({ ...media, poster_url: poster }))
+            }
+            onBackdrop={(backdrop) =>
+              setExecutionPreview((media) => ({
+                ...media,
+                backdrop_url: backdrop,
+              }))
+            }
+          />
+        )}
         {isHelpResourcesOpen && (
           <UploadHelpResourcesModal
             updateStatus={updateStatus}
@@ -6487,10 +8098,11 @@ function AudionutsUAGUI() {
           <div
             className={`flex flex-col h-full ${activePanel === "main" ? "" : "hidden"}`}
           >
+            {renderUploadTabs()}
             {/* Top controls */}
             {!isExecuting && !isTerminalView && (
               <div
-                className={`p-3 space-y-3 border-b flex-1 min-h-0 overflow-y-auto ${isDarkMode ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}`}
+                className={`ua-upload-workspace-main p-3 space-y-3 border-b flex-1 min-h-0 overflow-y-auto ${isDarkMode ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}`}
               >
                 {renderSelectedPathOrQueue(true)}
 
@@ -6562,18 +8174,12 @@ function AudionutsUAGUI() {
                 <div className="flex gap-2">
                   <button
                     onClick={executeCommand}
-                    disabled={
-                      (!selectedPath && selectedPaths.length === 0) ||
-                      isExecuting
-                    }
+                    disabled={executeDisabled}
+                    title={executeButtonTitle}
                     className="ua-accent-action flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-lg disabled:bg-gray-400 disabled:cursor-not-allowed font-medium"
                   >
                     <PlayIcon />
-                    {isExecuting
-                      ? "Executing..."
-                      : selectedPaths.length > 1
-                        ? "Execute Queue"
-                        : "Execute Upload"}
+                    {getExecuteButtonLabel()}
                   </button>
                   <button
                     onClick={clearTerminal}
@@ -6602,7 +8208,7 @@ function AudionutsUAGUI() {
 
             {/* Terminal output */}
             <div
-              className={`${isExecuting || isTerminalView ? "flex-1 p-3" : "flex-none p-2"} flex flex-col min-h-0 overflow-hidden ${isDarkMode ? "bg-gray-900" : "bg-gray-100"}`}
+              className={`ua-upload-output-panel ${isExecuting || isTerminalView ? "flex-1 p-3" : "flex-none p-2"} flex flex-col min-h-0 overflow-hidden ${isDarkMode ? "bg-gray-900" : "bg-gray-100"}`}
             >
               <div
                 className={`flex items-center gap-2 ${isExecuting || isTerminalView ? "mb-2" : ""} flex-shrink-0`}
@@ -6618,7 +8224,7 @@ function AudionutsUAGUI() {
                 {isExecuting && (
                   <span className="ml-auto inline-flex items-center gap-1 text-xs text-green-400 animate-pulse">
                     <LucideIcon name="circle" className="h-2.5 w-2.5" />
-                    Running
+                    {activeTabScheduled ? "Scheduled" : "Running"}
                   </span>
                 )}
                 {isExecuting && (
@@ -6629,7 +8235,7 @@ function AudionutsUAGUI() {
                     className="flex items-center gap-1 rounded px-2 py-1 text-xs bg-red-600 hover:bg-red-700 text-white"
                   >
                     <TrashIcon />
-                    Kill
+                    {killButtonLabel}
                   </button>
                 )}
                 {!isExecuting && (
@@ -6651,7 +8257,7 @@ function AudionutsUAGUI() {
                 )}
               </div>
               <div
-                ref={richOutputRef}
+                ref={attachRichOutputHost}
                 id="rich-output"
                 className={`min-h-0 rounded-lg overflow-auto p-2 border text-sm bg-black border-gray-700 text-white ${isExecuting || isTerminalView ? "flex-1" : "hidden"}`}
               ></div>
@@ -6884,6 +8490,7 @@ function AudionutsUAGUI() {
           {/* Screenshot Review Panel */}
           {activePanel === "screenshots" && renderScreenshotsPanel()}
           {activePanel === "description" && renderDescriptionPanel()}
+          {activePanel === "mediainfo" && renderMediaInfoPanel()}
         </div>
 
         {/* Bottom Nav */}
@@ -6910,6 +8517,7 @@ function AudionutsUAGUI() {
             isExecuting ? "Media" : "Arguments",
           )}
           {isExecuting &&
+            showScreenshotsButton &&
             navButton(
               "screenshots",
               <ScreenshotsIcon />,
@@ -6917,6 +8525,9 @@ function AudionutsUAGUI() {
             )}
           {isExecuting &&
             navButton("description", <DescriptionIcon />, "Description")}
+          {isExecuting &&
+            showMediaInfoButton &&
+            navButton("mediainfo", <MediaInfoIcon />, mediaInfoLabel)}
         </div>
       </div>
     );
@@ -6927,7 +8538,9 @@ function AudionutsUAGUI() {
   const desktopUploadStatusTitle = isAwaitingTerminalInput
     ? "Input required"
     : isExecuting
-      ? "Upload running"
+      ? activeTabScheduled
+        ? "Upload scheduled"
+        : "Upload running"
       : selectedPaths.length > 0 || selectedPath
         ? "Ready to upload"
         : "Ready";
@@ -6945,6 +8558,19 @@ function AudionutsUAGUI() {
       className={`ua-upload-page flex h-screen ${isDarkMode ? "bg-gray-900" : "bg-gray-50"} overflow-hidden`}
       data-mode={isDarkMode ? "dark" : "light"}
     >
+      {screenshotMode && (
+        <ScreenshotModeControls
+          onPoster={(poster) =>
+            setExecutionPreview((media) => ({ ...media, poster_url: poster }))
+          }
+          onBackdrop={(backdrop) =>
+            setExecutionPreview((media) => ({
+              ...media,
+              backdrop_url: backdrop,
+            }))
+          }
+        />
+      )}
       {isHelpResourcesOpen && (
         <UploadHelpResourcesModal
           updateStatus={updateStatus}
@@ -6997,8 +8623,8 @@ function AudionutsUAGUI() {
             </div>
           </div>
           <div className="ua-upload-context-resize-gutter shrink-0" />
-          <div className="ua-upload-context-status flex min-w-0 flex-1 items-center px-4 sm:px-6 lg:px-8">
-            <div className="min-w-0">
+          <div className="ua-upload-context-status flex min-w-0 flex-1 items-center gap-4 px-4 sm:px-6 lg:px-8">
+            <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="truncate text-lg font-bold sm:text-xl">
                   {desktopUploadStatusTitle}
@@ -7012,7 +8638,7 @@ function AudionutsUAGUI() {
                       className="ua-workspace-run-dot animate-pulse"
                       aria-hidden="true"
                     ></span>
-                    Running
+                    {activeTabScheduled ? "Scheduled" : "Running"}
                   </span>
                 )}
               </div>
@@ -7027,6 +8653,73 @@ function AudionutsUAGUI() {
                 {desktopUploadStatusDetail}
               </p>
             </div>
+            {isExecuting && (
+              <div className="flex shrink-0 items-center gap-2">
+                {showScreenshotsButton && (
+                  <button
+                    onClick={() => {
+                      setIsScreenshotReviewOpen((open) => !open);
+                      setIsDescriptionReviewOpen(false);
+                      setIsMediaInfoOpen(false);
+                    }}
+                    aria-pressed={isScreenshotReviewOpen}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${isScreenshotReviewOpen ? "ua-accent-action" : isDarkMode ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
+                    title="Review generated screenshots"
+                  >
+                    <ScreenshotsIcon />
+                    Screenshots
+                    {executionScreenshots.length
+                      ? ` (${executionScreenshots.length})`
+                      : ""}
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    setIsDescriptionReviewOpen((open) => !open);
+                    setIsScreenshotReviewOpen(false);
+                    setIsMediaInfoOpen(false);
+                  }}
+                  aria-pressed={isDescriptionReviewOpen}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${isDescriptionReviewOpen ? "ua-accent-action" : isDarkMode ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
+                  title="Review and edit the base description"
+                >
+                  <DescriptionIcon />
+                  Description
+                </button>
+                {showMediaInfoButton && (
+                  <button
+                    onClick={() => {
+                      setIsMediaInfoOpen((open) => !open);
+                      setIsScreenshotReviewOpen(false);
+                      setIsDescriptionReviewOpen(false);
+                    }}
+                    aria-pressed={isMediaInfoOpen}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${isMediaInfoOpen ? "ua-accent-action" : isDarkMode ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
+                    title={`View the ${mediaInfoLabel} report`}
+                  >
+                    <MediaInfoIcon />
+                    {mediaInfoLabel}
+                  </button>
+                )}
+                <button
+                  onClick={clearTerminal}
+                  aria-label={
+                    activeTabScheduled
+                      ? "Cancel scheduled upload"
+                      : "Kill process and clear terminal"
+                  }
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg transition-colors bg-red-600 hover:bg-red-700 text-white"
+                  title={
+                    activeTabScheduled
+                      ? "Cancel scheduled upload"
+                      : "Kill process and clear terminal"
+                  }
+                >
+                  <TrashIcon />
+                  {killButtonLabel}
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -7285,53 +8978,13 @@ function AudionutsUAGUI() {
 
           {/* Main Content */}
           <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden">
+            {renderUploadTabs()}
             {/* Top Panel */}
             <div
-              className={`ua-upload-workspace-main ${isDarkMode ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"} border-b ${isExecuting ? "p-3" : "p-4"} ${isExecuting ? "flex-shrink-0" : isTerminalView ? "hidden" : "flex-1 min-h-0 overflow-y-auto"}`}
+              className={`ua-upload-workspace-main ${isDarkMode ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"} border-b p-4 ${isExecuting || isTerminalView ? "hidden" : "flex-1 min-h-0 overflow-y-auto"}`}
             >
-              <div
-                className={`${isExecuting ? "w-full" : "mx-auto max-w-6xl"} space-y-4`}
-              >
-                {isExecuting ? (
-                  <div className="flex flex-wrap items-center justify-end gap-4">
-                    <button
-                      onClick={() => {
-                        setIsScreenshotReviewOpen((open) => !open);
-                        setIsDescriptionReviewOpen(false);
-                      }}
-                      aria-pressed={isScreenshotReviewOpen}
-                      className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors flex-shrink-0 ${isScreenshotReviewOpen ? "ua-accent-action" : isDarkMode ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
-                      title="Review generated screenshots"
-                    >
-                      <ScreenshotsIcon />
-                      Screenshots
-                      {executionScreenshots.length
-                        ? ` (${executionScreenshots.length})`
-                        : ""}
-                    </button>
-                    <button
-                      onClick={() => {
-                        setIsDescriptionReviewOpen((open) => !open);
-                        setIsScreenshotReviewOpen(false);
-                      }}
-                      aria-pressed={isDescriptionReviewOpen}
-                      className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors flex-shrink-0 ${isDescriptionReviewOpen ? "ua-accent-action" : isDarkMode ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
-                      title="Review and edit the base description"
-                    >
-                      <DescriptionIcon />
-                      Description
-                    </button>
-                    <button
-                      onClick={clearTerminal}
-                      aria-label="Kill process and clear terminal"
-                      className="flex items-center gap-2 px-4 py-2 rounded-lg transition-colors bg-red-600 hover:bg-red-700 text-white flex-shrink-0"
-                      title="Kill process and clear terminal"
-                    >
-                      <TrashIcon />
-                      Kill
-                    </button>
-                  </div>
-                ) : (
+              <div className="mx-auto max-w-6xl space-y-4">
+                {!isExecuting && (
                   <>
                     {/* Selected Path Display / Queue */}
                     {renderSelectedPathOrQueue(false)}
@@ -7456,18 +9109,12 @@ function AudionutsUAGUI() {
                     <div className="flex gap-2">
                       <button
                         onClick={executeCommand}
-                        disabled={
-                          (!selectedPath && selectedPaths.length === 0) ||
-                          isExecuting
-                        }
+                        disabled={executeDisabled}
+                        title={executeButtonTitle}
                         className="ua-accent-action flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-lg disabled:bg-gray-400 disabled:cursor-not-allowed font-medium text-lg"
                       >
                         <PlayIcon />
-                        {isExecuting
-                          ? "Executing..."
-                          : selectedPaths.length > 1
-                            ? "Execute Queue"
-                            : "Execute Upload"}
+                        {getExecuteButtonLabel()}
                       </button>
                       <button
                         onClick={clearTerminal}
@@ -7509,24 +9156,20 @@ function AudionutsUAGUI() {
               <div
                 className={`max-w-6xl mx-auto w-full ${isExecuting || isTerminalView ? "flex-1" : "flex-none"} flex flex-col min-h-0`}
               >
-                <div
-                  className={`flex items-center gap-2 ${isExecuting || isTerminalView ? "mb-3" : ""} flex-shrink-0`}
-                >
-                  <span className={isDarkMode ? "text-white" : "text-gray-800"}>
-                    <TerminalIcon />
-                  </span>
-                  <h3
-                    className={`text-lg font-bold ${isDarkMode ? "text-white" : "text-gray-800"}`}
+                {!isExecuting && (
+                  <div
+                    className={`flex items-center gap-2 ${isTerminalView ? "mb-3" : ""} flex-shrink-0`}
                   >
-                    Execution Output
-                  </h3>
-                  {isExecuting && (
-                    <span className="ml-auto inline-flex items-center gap-1 text-sm text-green-400 animate-pulse">
-                      <LucideIcon name="circle" className="h-3 w-3" />
-                      Running
+                    <span
+                      className={isDarkMode ? "text-white" : "text-gray-800"}
+                    >
+                      <TerminalIcon />
                     </span>
-                  )}
-                  {!isExecuting && (
+                    <h3
+                      className={`text-lg font-bold ${isDarkMode ? "text-white" : "text-gray-800"}`}
+                    >
+                      Execution Output
+                    </h3>
                     <button
                       onClick={() => setIsTerminalView((expanded) => !expanded)}
                       aria-expanded={isTerminalView}
@@ -7542,11 +9185,11 @@ function AudionutsUAGUI() {
                       )}
                       {isTerminalView ? "Back to preparation" : "View terminal"}
                     </button>
-                  )}
-                </div>
+                  </div>
+                )}
                 {/* Rich HTML output (rendered from Rich export_html fragments) */}
                 <div
-                  ref={richOutputRef}
+                  ref={attachRichOutputHost}
                   id="rich-output"
                   className={`min-h-0 rounded-lg overflow-auto p-3 border bg-black border-gray-700 text-white ${isExecuting || isTerminalView ? "flex-1" : "hidden"}`}
                 ></div>
@@ -7618,10 +9261,13 @@ function AudionutsUAGUI() {
         }}
       >
         {isExecuting ? (
-          isScreenshotReviewOpen ? (
+          isScreenshotReviewOpen && expandedReviewPanel !== "screenshots" ? (
             renderScreenshotsPanel()
-          ) : isDescriptionReviewOpen ? (
+          ) : isDescriptionReviewOpen &&
+            expandedReviewPanel !== "description" ? (
             renderDescriptionPanel()
+          ) : isMediaInfoOpen && expandedReviewPanel !== "mediainfo" ? (
+            renderMediaInfoPanel()
           ) : (
             renderExecutionPreviewPanel()
           )
@@ -7803,6 +9449,50 @@ function AudionutsUAGUI() {
           </>
         )}
       </div>
+      {isExecuting && !isMobile && expandedReviewPanel && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 sm:p-6"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeReviewModal();
+          }}
+        >
+          <section
+            ref={reviewModalRef}
+            className={`flex h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border shadow-2xl ${isDarkMode ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label={
+              expandedReviewPanel === "screenshots"
+                ? "Generated screenshots"
+                : expandedReviewPanel === "description"
+                  ? "Description review"
+                  : mediaInfoLabel
+            }
+            tabIndex="-1"
+          >
+            {isAwaitingTerminalInput && (
+              <div className="flex flex-none items-center justify-between gap-3 bg-amber-500 px-4 py-2 text-sm font-semibold text-gray-950">
+                <span>The upload is waiting for your input.</span>
+                <button
+                  type="button"
+                  onClick={closeReviewModal}
+                  className="rounded-md bg-gray-950/15 px-3 py-1 text-xs font-semibold hover:bg-gray-950/25"
+                >
+                  Go to terminal
+                </button>
+              </div>
+            )}
+            <div className="min-h-0 flex-1">
+              {expandedReviewPanel === "screenshots"
+                ? renderScreenshotsPanel()
+                : expandedReviewPanel === "description"
+                  ? renderDescriptionPanel()
+                  : renderMediaInfoPanel()}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

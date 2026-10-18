@@ -6,6 +6,7 @@ import json
 import os
 import re
 import ssl
+import unicodedata
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import URLError
@@ -28,6 +29,15 @@ def _coerce_int(value: Any) -> int | None:
         return int(value)
     except TypeError, ValueError:
         return None
+
+
+def _normalized_series_title(value: str) -> str:
+    value = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", value)
+    value = unicodedata.normalize("NFKD", value).casefold()
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    # Release names drop apostrophes ("Examples Show" for "Example's Show").
+    value = re.sub(r"['\u2019]", "", value)
+    return " ".join(re.findall(r"[^\W_]+", value))
 
 
 def _as_dict_list(value: Any) -> list[dict[str, Any]]:
@@ -239,7 +249,10 @@ def _get_tvdb_or_warn(config: dict[str, Any] | None = None) -> TVDB | None:
     if not isinstance(tvdb_api_key, str) or not tvdb_api_key.strip():
         if not _tvdb_error_reported:
             _tvdb_error_reported = True
-            logger.info("[yellow]TVDB API key is missing in config.py under DEFAULT section. Continuing without TVDB.[/yellow]")
+            logger.info(
+                "[yellow]TVDB API key is not configured. Direct TVDB lookups are unavailable; "
+                "TVDB IDs will be obtained from TMDb when available.[/yellow]"
+            )
         return None
 
     try:
@@ -311,7 +324,7 @@ class TvdbData:
     async def search_tvdb_series(
         self,
         filename: str,
-        year: str | None = None,
+        year: int | str | None = None,
     ) -> tuple[list[dict[str, Any]] | None, int | None]:
         logger.debug(f"filename for TVDB search: {filename} year: {year}")
         client = _get_tvdb_or_warn(self.config)
@@ -327,43 +340,36 @@ class TvdbData:
             results = await client.search(filename, year=year, type="series", lang="eng")
             await cache.set("tvdb", "search", cache_key, results, negative=not bool(results))
 
-        try:
-            if results and len(results) > 0:
-                # Try to find the best match based on year
-                best_match: dict[str, Any] | None = None
-                search_year = year if year else ""
-
-                if search_year:
-                    # First, try to find exact year match
-                    for result in results:
-                        if result.get("year") == search_year:
-                            best_match = result
-                            break
-
-                # If no exact match, check aliases for year-based names
-                if not best_match and search_year:
-                    for result in results:
-                        aliases_raw = result.get("aliases", [])
-                        aliases = aliases_raw if isinstance(aliases_raw, list) else []
-                        if aliases:
-                            # Check if any alias contains the year in parentheses
-                            for alias in aliases:
-                                alias_name = str(cast(dict[str, Any], alias).get("name", "")) if isinstance(alias, dict) else str(alias)
-                                if f"({search_year})" in alias_name:
-                                    best_match = result
-                                    break
-                            if best_match:
-                                break
-
-                # If still no match, use first result
-                if not best_match:
-                    best_match = results[0]
-
-                series_id = best_match["tvdb_id"] if best_match else None
-                logger.debug(f"[blue]TVDB series ID: {series_id}[/blue]")
-                return results, _coerce_int(series_id)
+        if not results:
             logger.info("[yellow]No TVDB results found[/yellow]")
             return None, None
+
+        try:
+            search_title = _normalized_series_title(filename)
+            search_year = str(year or "")
+            matches: list[dict[str, Any]] = []
+            for result in results:
+                titles = [result.get("name"), result.get("name_translated")]
+                aliases = result.get("aliases")
+                if isinstance(aliases, list):
+                    titles.extend(alias.get("name") if isinstance(alias, dict) else alias for alias in aliases)
+                translations = result.get("translations")
+                if isinstance(translations, dict):
+                    titles.extend(translations.values())
+                names = [title for title in titles if isinstance(title, str) and _normalized_series_title(title) == search_title]
+                if not search_title or not names:
+                    continue
+                if search_year and str(result.get("year") or "") != search_year and not any(name.rstrip().endswith(f"({search_year})") for name in names):
+                    continue
+                matches.append(result)
+
+            if len(matches) != 1:
+                logger.info("[yellow]No unique TVDB title/year match found. Specify --tvdb to select a series.[/yellow]")
+                return results, None
+
+            series_id = _coerce_int(matches[0].get("tvdb_id"))
+            logger.debug(f"[blue]TVDB series ID: {series_id}[/blue]")
+            return results, series_id
         except Exception as e:
             logger.error(f"[red]Error: {e}[/red]")
             return None, None
@@ -460,6 +466,7 @@ class TvdbData:
                                 "slug": cached_dict.get("slug") if isinstance(cached_dict.get("slug"), str) else None,
                                 "series_title": cached_dict.get("series_title") if isinstance(cached_dict.get("series_title"), str) else None,
                                 "series_year": cached_dict.get("series_year") if isinstance(cached_dict.get("series_year"), str) else None,
+                                "series_name": cached_dict.get("series_name") if isinstance(cached_dict.get("series_name"), str) else None,
                             }
 
                             if not episodes_data.get("series_title") and not episodes_data.get("series_year"):
@@ -475,6 +482,8 @@ class TvdbData:
                                             _series_info=series_info,
                                         )
                                         episodes_data.update(series_metadata)
+                                        if not episodes_data.get("series_name") and series_info.get("name"):
+                                            episodes_data["series_name"] = series_info["name"]
                                     except Exception as series_error:
                                         logger.debug(f"[yellow]Could not refresh cached TVDB series metadata: {series_error}[/yellow]")
 
@@ -550,6 +559,7 @@ class TvdbData:
                 "slug": series_slug,
                 "series_title": None,
                 "series_year": None,
+                "series_name": None,
             }
 
             # Try to get aliases from series info (may need separate call)
@@ -559,6 +569,8 @@ class TvdbData:
                     series_info = await client.get_series_extended(series_id_int)
                     if "aliases" in series_info:
                         episodes_data["aliases"] = series_info["aliases"]
+                    if "name" in series_info:
+                        episodes_data["series_name"] = series_info["name"]
                     aliases_list = _as_dict_list(episodes_data["aliases"])
                     episodes_data.update(
                         await _series_translation_metadata(
