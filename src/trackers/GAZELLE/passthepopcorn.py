@@ -1950,6 +1950,8 @@ class PassThePopcorn:
             if error_message:
                 status_message += f" | {error_message}"
             meta.tracker_status[self.tracker]["status_message"] = status_message
+            if error_message and re.search(r'\bthe same base save path\s+"[^"]+"\s+already exists on the site\b', error_message, re.IGNORECASE):
+                meta.tracker_status[self.tracker]["dupe"] = True
             return False
 
         if match:

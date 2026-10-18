@@ -394,7 +394,15 @@ async def test_unattended_form_prerequisites_overlap_without_mutating_live_host(
 
 
 @pytest.mark.asyncio
-async def test_upload_failure_preserves_error_message_and_response_html(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("error_message", "is_dupe"),
+    [
+        ("Invalid piece size.", False),
+        ('The same base save path "movie.mkv" already exists on the site!', True),
+        ("An unrelated upload error already exists on the site!", False),
+    ],
+)
+async def test_upload_failure_preserves_error_message_and_response_html(monkeypatch, tmp_path, error_message, is_dupe):
     tracker = object.__new__(PassThePopcorn)
     tracker.config = {}
     tracker.user_agent = "test"
@@ -403,12 +411,13 @@ async def test_upload_failure_preserves_error_message_and_response_html(monkeypa
     release_dir = tmp_path / "tmp" / "release"
     release_dir.mkdir(parents=True)
     tracker._prepared_upload_torrent = (str(release_dir / "[PASSTHEPOPCORN].torrent"), b"torrent")
-    html = '<div class="alert--error">Invalid piece size.</div>'
+    html = f'<div class="alert--error">{error_message}</div>'
     original_client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(lambda _request: httpx.Response(200, text=html)), **kwargs))
     monkeypatch.setattr("src.cookie_auth.find_cookie_file", lambda *_args: "unused")
 
     assert await tracker.upload(meta, "https://passthepopcorn.me/upload.php", {}) is False  # noqa: S101
-    assert "Invalid piece size." in meta.tracker_status[tracker.tracker]["status_message"]  # noqa: S101
+    assert error_message in meta.tracker_status[tracker.tracker]["status_message"]  # noqa: S101
+    assert bool(meta.tracker_status[tracker.tracker].get("dupe")) is is_dupe  # noqa: S101
     assert not meta.tracker_status[tracker.tracker].get("upload_success")  # noqa: S101
     assert (release_dir / "[PASSTHEPOPCORN]PTP_upload_failure.html").read_text() == html  # noqa: S101
