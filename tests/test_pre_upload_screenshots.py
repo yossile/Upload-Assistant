@@ -8,8 +8,34 @@ import pytest
 from PIL import Image
 
 from src.meta import Meta
-from src.pre_upload_screenshots import SCREENSHOT_SOURCES, ScreenshotCandidates, prepare_tracker_screenshots
+from src.pre_upload_screenshots import SCREENSHOT_SOURCES, AitherScreenshotSource, ScreenshotCandidates, prepare_tracker_screenshots
 from src.screenshot_manifest import files
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "logo,position,thumbnail_size",
+    [("aaC2N2nf0VBxR2Mp.png", "before", 500), ("y6nfEPrCxpW57juD.png", "after", 350)],
+)
+@pytest.mark.parametrize("has_screenshots", [False, True])
+async def test_aither_discovery_excludes_standalone_logos(logo, position, thumbnail_size, has_screenshots):
+    logo_url = f"https://file.aither.cc/u/{logo}"
+    artwork = f"[center][img=200]{logo_url}[/img][/center]"
+    screenshot_urls = [f"https://file.aither.cc/u/shot{index}.png" for index in range(6)] if has_screenshots else []
+    screenshots = "[center]" + "\n".join(
+        f"[url=https://onlyimage.org/image/shot{index}]\n[img={thumbnail_size}]{url}[/img]\n[/url]"
+        for index, url in enumerate(screenshot_urls)
+    ) + "[/center]"
+    description = artwork + screenshots if position == "before" else screenshots + artwork
+
+    def handler(_request):
+        return httpx.Response(200, json={"attributes": {"category": "Movie", "resolution": "1080p", "description": description}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as session:
+        candidates = await AitherScreenshotSource().discover(session, "123", {"api_key": "test-key"})
+
+    assert candidates.urls == screenshot_urls
+    assert logo_url not in candidates.urls
 
 
 @pytest.mark.asyncio
@@ -71,7 +97,7 @@ async def test_failures_keep_local_capture_or_upload_fallback(tmp_path, failure)
         if request.url.host == "aither.cc":
             if failure == "api":
                 return httpx.Response(503)
-            description = "".join(f"[img]https://file.aither.cc/u/{name}.png[/img]" for name in ("broken", "banner", "valid", "valid", "second"))
+            description = "".join(f"[url=https://images.example/{name}][img]https://file.aither.cc/u/{name}.png[/img][/url]" for name in ("broken", "banner", "valid", "valid", "second"))
             return httpx.Response(200, json={"attributes": {"category": "Movie", "resolution": "720p", "description": description}})
         downloaded.append(str(request.url))
         if "broken" in request.url.path:

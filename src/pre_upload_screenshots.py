@@ -41,7 +41,8 @@ class AitherScreenshotSource:
         if resolution is None or attributes.get("category") not in ("Movie", "TV"):
             return ScreenshotCandidates([], 0)
         urls = re.findall(
-            r"\[img(?:=[^\]]*)?\]\s*(https://file\.aither\.cc/u/[A-Za-z0-9_-]+\.(?:png|jpe?g))\s*\[/img\]",
+            r"\[url=https?://[^\]]+\]\s*\[img(?:=[^\]]*)?\]\s*"
+            r"(https://file\.aither\.cc/u/[A-Za-z0-9_-]+\.(?:png|jpe?g))\s*\[/img\]\s*\[/url\]",
             attributes.get("description") or "",
             re.IGNORECASE,
         )

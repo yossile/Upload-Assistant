@@ -38,7 +38,7 @@
 
 - Pre-upload screenshots (Aither beta): set `"pre_upload_screenshots": True` in `TRACKERS["AITHER"]` alongside its `api_key`.
   - Disabled by default. For an incomplete matching qBittorrent torrent, the source is identified from its comment URL, for both path and torrent-hash inputs.
-  - Randomly selects direct Aither-hosted description images, validates them against the source resolution, and downloads up to the configured `screens` count (or `--screens` override) while the media downloads.
+  - Randomly selects direct Aither-hosted images wrapped in clickable BBCode links, validates them against the source resolution, and downloads up to the configured `screens` count (or `--screens` override) while the media downloads. Standalone images are ignored to exclude logos and other artwork; descriptions without enough linked screenshots fall back to local capture.
   - A complete set is re-hosted through the configured image hosts before waiting for download completion. Local files remain available for retries; missing screenshots fall back to normal media capture.
   - Screenshot discovery and ID metadata lookup share the same torrent-detail response, including overlapping requests. Successful responses are reused in memory for up to 24 hours (maximum 128 entries per event loop), scoped to the endpoint and API account; failures remain retryable.
   - Manual frames, screenshot retakes, frame overlays, and non-video categories keep their normal capture behavior. No other source tracker is enabled in this beta.

@@ -82,7 +82,7 @@ async def test_screenshots_and_ids_share_one_detail_request(monkeypatch, order):
             "imdb_id": 113277,
             "category": "Movie",
             "resolution": "720p",
-            "description": f"[img=500]{screenshot_url}[/img]",
+            "description": f"[url=https://images.example/screenshot][img=500]{screenshot_url}[/img][/url]",
         }})
 
     client_class = httpx.AsyncClient
