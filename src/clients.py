@@ -907,6 +907,14 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                     if isinstance(torrent_name_value, str) and torrent_name_value:
                         prefetch_task = self._start_hash_metadata_prefetch(meta, torrent_name_value, str(content_path), comment_tracker_ids)
                     try:
+                        from src.pre_upload_screenshots import prepare_tracker_screenshots
+
+                        screenshot_meta = meta.copy()
+                        screenshot_meta.uuid = Path(resolved_path).name
+                        await prepare_tracker_screenshots(screenshot_meta, self.config, comment_tracker_ids)
+                        meta.image_list = screenshot_meta.image_list
+                        meta.image_sizes = screenshot_meta.image_sizes
+                        meta.imghost = screenshot_meta.imghost
                         await self._wait_for_qbittorrent_download(client_value, infohash)
                         if prefetch_task is not None:
                             key = (str(meta.base_dir), infohash.lower())

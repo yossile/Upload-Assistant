@@ -611,6 +611,9 @@ config: dict[str, Any] = {
             # "use_for_search": False, set to True if using this tracker for automatic ID searching or description parsing
             "use_for_search": False,
             "api_key": "",
+            # Beta: download and re-host description screenshots while the source torrent downloads in qBittorrent.
+            # Uses the configured screenshot count; missing images fall back to normal media capture.
+            "pre_upload_screenshots": False,
             "anon": True,
             # Send uploads to the moderation queue for staff review and approval
             "modq": False,

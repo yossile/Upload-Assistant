@@ -362,7 +362,7 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
                     "name": "Release",
                     "state": "downloading",
                     "progress": 0.5,
-                    "comment": "comment from downloading torrent",
+                    "comment": "https://aither.cc/torrents/123",
                 }
             ]
         )
@@ -370,13 +370,21 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
     with (
         patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)) as init_client,
         patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
+        patch("src.pre_upload_screenshots.prepare_tracker_screenshots", AsyncMock()) as prepare_screenshots,
     ):
+        async def check_screenshots_prepared(*_args):
+            screenshot_meta, screenshot_config, tracker_ids = prepare_screenshots.await_args.args
+            assert screenshot_meta.uuid == "movie.mkv"
+            assert screenshot_config is clients.config
+            assert tracker_ids == {"aither": "123"}
+
+        wait_for_download.side_effect = check_screenshots_prepared
         meta = Meta()
         resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
 
     assert resolved == str(media)
     assert meta.source_torrent_hash == infohash
-    assert meta.torrent_comments == [{"hash": infohash, "name": "Release", "comment": "comment from downloading torrent"}]
+    assert meta.torrent_comments == [{"hash": infohash, "name": "Release", "comment": "https://aither.cc/torrents/123"}]
     wait_for_download.assert_awaited_once_with(client_config, infohash)
 
     meta.infohash = infohash
@@ -384,7 +392,7 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
     with patch.object(clients, "_extract_tracker_ids_from_comment", return_value={"PTP": "456"}) as extract_comment:
         await clients.get_ptp_from_hash_qbit(meta, client_config, pathed=True)
 
-    extract_comment.assert_called_once_with("comment from downloading torrent")
+    extract_comment.assert_called_once_with("https://aither.cc/torrents/123")
     assert meta.get_tracker_id("PTP") == "456"
     init_client.assert_awaited_once()
 
@@ -733,6 +741,7 @@ async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -
         name="Release",
         state="downloading",
         progress=0.5,
+        comment="https://aither.cc/torrents/123",
     )
     meta = Meta({"path": str(content_path), "uuid": "Release"})
 
@@ -741,7 +750,12 @@ async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -
         patch.object(clients, "_fetch_qbit_search_results", AsyncMock(return_value=[matching_torrent])) as fetch_results,
         patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
         patch.object(clients, "_start_hash_metadata_prefetch") as start_prefetch,
+        patch("src.pre_upload_screenshots.prepare_tracker_screenshots", AsyncMock()) as prepare_screenshots,
     ):
+        async def check_screenshots_prepared(*_args):
+            prepare_screenshots.assert_awaited_once_with(meta, clients.config, {"aither": "123"})
+
+        wait_for_download.side_effect = check_screenshots_prepared
         await clients.preflight_qbittorrent_search(meta, [])
 
     fetch_results.assert_awaited_once()

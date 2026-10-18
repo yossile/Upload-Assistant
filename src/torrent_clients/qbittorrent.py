@@ -129,7 +129,7 @@ class QbittorrentClientMixin:
             if not client_names and default_client != "none":
                 client_names = [default_client]
 
-        wait_candidates: list[tuple[dict[str, Any], str]] = []
+        wait_candidates: list[tuple[dict[str, Any], str, Any]] = []
         has_completed_match = False
         for client_name in client_names:
             client_value = self.config.get("TORRENT_CLIENTS", {}).get(client_name)
@@ -169,7 +169,7 @@ class QbittorrentClientMixin:
                         continue
                     torrent_hash = getattr(torrent, "hash", None)
                     if isinstance(torrent_hash, str) and torrent_hash:
-                        wait_candidates.append((client, torrent_hash))
+                        wait_candidates.append((client, torrent_hash, torrent))
             except Exception as error:
                 logger.warning(f"[yellow]Early qBittorrent search failed for '{client_name}': {error}")
             finally:
@@ -177,7 +177,11 @@ class QbittorrentClientMixin:
                     await qbt_session.aclose()
 
         if wait_candidates and not has_completed_match:
-            client, torrent_hash = wait_candidates[0]
+            client, torrent_hash, torrent = wait_candidates[0]
+            from src.pre_upload_screenshots import prepare_tracker_screenshots
+
+            tracker_ids = self._extract_tracker_ids_from_comment(str(getattr(torrent, "comment", "") or ""))
+            await prepare_tracker_screenshots(meta, self.config, tracker_ids)
             await self._wait_for_qbittorrent_download(client, torrent_hash)
 
     async def _wait_for_qbittorrent_download(self, client: dict[str, Any], torrent_hash: str) -> None:

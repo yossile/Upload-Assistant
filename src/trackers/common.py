@@ -24,6 +24,7 @@ from unidecode import unidecode
 
 from src.api_key_expiry import observe_tracker_response
 from src.bbcode import BBCODE
+from src.config_helpers import parse_bool
 from src.console import console, logger, prompt_in_thread
 from src.distributors import distributor_id as resolve_distributor_id
 from src.distributors import distributor_name
@@ -32,6 +33,7 @@ from src.genre_map import AUDIBLE_ENG_GENRE_MAP, AUDIBLE_PTBR_GENRE_MAP, ENG_TO_
 from src.languages import languages_manager
 from src.meta import Meta
 from src.torrent_manifest import TorrentManifest
+from src.tracker_api import fetch_unit3d_torrent
 from src.unit3d_catalogs import region_id as resolve_region_id
 from src.unit3d_catalogs import region_name as resolve_region_name
 from src.usenetcreate import verify_nzb_has_password
@@ -701,7 +703,10 @@ class Common:
                     logger.info(f"Searching for information on [bold cyan]{tracker.title()}[/bold cyan] ({public_torrent_url.rstrip('/')}/{id})")
                 else:
                     logger.info(f"Searching for information on [bold cyan]{tracker}[/bold cyan]")
-                response = await client.get(url=url, params=params, headers=headers)
+                if id and not file_name and parse_bool(self.config["TRACKERS"][tracker].get("pre_upload_screenshots", False)):
+                    response = await fetch_unit3d_torrent(client, url, api_key)
+                else:
+                    response = await client.get(url=url, params=params, headers=headers)
                 json_response = response.json()
                 observe_tracker_response(self.config, meta, tracker, response, json_response)
         except (httpx.RequestError, httpx.TimeoutException) as e:
