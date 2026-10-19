@@ -41,6 +41,7 @@ def reset_upload_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_tagged_upload_hashes", set())
     monkeypatch.setattr(server, "_completed_upload_hashes", {})
     monkeypatch.setattr(server, "_server_stopping", server.threading.Event())
+    monkeypatch.setattr(server, "_upload_pool", None)
 
 
 @pytest.mark.parametrize("allow_concurrent", [True, False])
@@ -65,6 +66,60 @@ def test_repeated_request_cancels_upload(monkeypatch: pytest.MonkeyPatch, allow_
     assert calls == ["start", "terminate", "wait"]
     assert client.get(url).status_code == 202
     assert calls[-1] == "start"
+
+
+def test_warm_upload_uses_pool_and_can_be_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    pool = Mock(submit=Mock(return_value=process))
+    monkeypatch.setattr(server, "_upload_pool", pool)
+    popen = Mock(side_effect=AssertionError("Must not start a fresh interpreter"))
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    client = server.app.test_client()
+    url = f"/upload?hash={'a' * 40}&debug=true"
+
+    started = client.get(url)
+    assert started.status_code == 202
+    assert started.json["pid"] == 4321
+    pool.submit.assert_called_once_with(["a" * 40, "--unattended", "--debug"])
+    cancelled = client.get(url)
+    assert cancelled.status_code == 200
+    assert cancelled.json["status"] == "cancelled"
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=5)
+    popen.assert_not_called()
+
+
+def test_full_pool_returns_busy_and_retries_tagged_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    pool = Mock(submit=Mock(return_value=None))
+    monkeypatch.setattr(server, "_upload_pool", pool)
+    response = server.app.test_client().get(f"/upload?hash={'a' * 40}")
+    assert response.status_code == 409
+    assert "workers are busy" in response.json["error"]
+    assert not server._submitted_upload_hashes
+    qbt_client = Mock()
+    qbt_client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40)]
+    server._poll_upload_tag(qbt_client)
+    assert not server._submitted_upload_hashes
+    pool.submit.return_value = process
+    server._poll_upload_tag(qbt_client)
+    assert server._active_upload_processes["a" * 40] is process
+
+
+@pytest.mark.parametrize(("returncode", "tag"), [(10, "Uploaded"), (11, "Cleanup")])
+def test_warm_upload_completion_retags_torrent(monkeypatch: pytest.MonkeyPatch, returncode: int, tag: str) -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    monkeypatch.setattr(server, "_upload_pool", Mock(submit=Mock(return_value=process)))
+    response = server.app.test_client().get(f"/upload?hash={'a' * 40}")
+    assert response.status_code == 202
+    process.poll.return_value = returncode
+    qbt_client = Mock()
+    server._retag_completed_uploads(qbt_client)
+    qbt_client.torrents_add_tags.assert_called_once_with(torrent_hashes="a" * 40, tags=tag)
+    qbt_client.torrents_remove_tags.assert_called_once_with(torrent_hashes="a" * 40, tags="Upload")
 
 
 def test_cancellation_kills_process_that_ignores_termination(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,9 +228,43 @@ def test_main_passes_host_and_port_to_server(monkeypatch: pytest.MonkeyPatch) ->
     run_args = []
     monkeypatch.setattr(server.app, "run", lambda **kwargs: run_args.append(kwargs))
 
-    assert server.main(["--host", "0.0.0.0", "--port", "9000", "--no-tag-watch"]) == 0
+    assert server.main(["--host", "0.0.0.0", "--port", "9000", "--no-tag-watch", "--workers", "0"]) == 0
 
     assert run_args == [{"host": "0.0.0.0", "port": 9000}]
+
+
+@pytest.mark.parametrize("arguments, expected_workers", [([], 5), (["--workers", "2"], 2)])
+def test_main_warms_pool_before_serving_and_closes_it(monkeypatch: pytest.MonkeyPatch, arguments: list[str], expected_workers: int) -> None:
+    pool = Mock()
+    start = Mock(return_value=pool)
+    monkeypatch.setattr(server, "_start_upload_pool", start)
+    monkeypatch.setattr(server, "_run_tag_watcher", Mock())
+
+    def serve(**_kwargs):
+        assert server._upload_pool is pool
+        pool.close.assert_not_called()
+
+    monkeypatch.setattr(server.app, "run", serve)
+    assert server.main(["--no-tag-watch", *arguments]) == 0
+    start.assert_called_once_with(expected_workers)
+    pool.close.assert_called_once_with()
+    assert server._upload_pool is None
+
+
+def test_main_reports_pool_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_start_upload_pool", Mock(side_effect=RuntimeError("worker initialization failed")))
+    serve = Mock()
+    monkeypatch.setattr(server.app, "run", serve)
+    previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
+    assert server.main([]) == 1
+    serve.assert_not_called()
+    assert server.signal.getsignal(server.signal.SIGTERM) == previous_sigterm
+
+
+def test_main_rejects_negative_worker_count() -> None:
+    with pytest.raises(SystemExit) as error:
+        server.main(["--workers", "-1"])
+    assert error.value.code == 2
 
 
 def test_main_enables_upload_start_logs(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -189,7 +278,7 @@ def test_main_enables_upload_start_logs(monkeypatch: pytest.MonkeyPatch, caplog:
     monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
     monkeypatch.setattr(server.app, "run", lambda **_kwargs: server._poll_upload_tag(client))
 
-    assert server.main(["--no-tag-watch"]) == 0
+    assert server.main(["--no-tag-watch", "--workers", "0"]) == 0
 
     assert server.app.logger.isEnabledFor(logging.INFO)
     assert f"Started upload for tagged torrent {'a' * 40}" in caplog.text
@@ -208,7 +297,7 @@ def test_watch_only_runs_without_http_and_cleans_up(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(server.threading, "Thread", thread_factory)
     previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
 
-    assert server.main(["--watch-only", "--poll-interval", "10", "--existing-tagged", "skip"]) == 0
+    assert server.main(["--watch-only", "--poll-interval", "10", "--existing-tagged", "skip", "--workers", "0"]) == 0
 
     watch.assert_called_once()
     stop, interval, policy = watch.call_args.args
@@ -525,7 +614,7 @@ def test_main_starts_five_second_watcher_and_stops_it(monkeypatch: pytest.Monkey
     monkeypatch.setattr(server.threading, "Thread", thread_factory)
     monkeypatch.setattr(server.app, "run", Mock())
 
-    assert server.main([]) == 0
+    assert server.main(["--workers", "0"]) == 0
 
     kwargs = thread_factory.call_args.kwargs
     assert kwargs["target"] is server._run_tag_watcher
@@ -722,7 +811,7 @@ def test_normal_shutdown_stops_active_uploads(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(server.app, "run", Mock())
     previous_sigterm = server.signal.getsignal(server.signal.SIGTERM)
 
-    assert server.main(["--no-tag-watch"]) == 0
+    assert server.main(["--no-tag-watch", "--workers", "0"]) == 0
 
     process.terminate.assert_called_once_with()
     process.wait.assert_called_once_with(timeout=5)
@@ -742,7 +831,7 @@ def test_sigterm_stops_uploads_and_restores_handler(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(server.app, "run", run)
     with pytest.raises(SystemExit) as error:
-        server.main(["--no-tag-watch"])
+        server.main(["--no-tag-watch", "--workers", "0"])
 
     assert error.value.code == 0
     process.terminate.assert_called_once_with()

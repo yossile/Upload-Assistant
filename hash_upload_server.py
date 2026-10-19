@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from flask import Flask, jsonify, request
 
+from src.hash_upload_pool import UploadPool, UploadProcess
+
 if TYPE_CHECKING:
     from qbittorrentapi import Client
 
@@ -24,8 +26,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 UPLOAD_SCRIPT = PROJECT_ROOT / "upload.py"
 TORRENT_HASH_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 ALLOW_CONCURRENT_UPLOADS = True
+UploadHandle = subprocess.Popen[bytes] | UploadProcess
 _upload_lock = threading.Lock()
-_active_upload_processes: dict[str, subprocess.Popen[bytes]] = {}
+_upload_pool: UploadPool | None = None
+_active_upload_processes: dict[str, UploadHandle] = {}
 _submitted_upload_hashes: set[str] = set()
 _tagged_upload_hashes: set[str] = set()
 _completed_upload_hashes: dict[str, str] = {}
@@ -60,7 +64,7 @@ def _retag_completed_uploads(qbt_client: Client) -> None:
             app.logger.info("Replaced Upload tag with %s for %s", tag, torrent_hash)
 
 
-def _stop_upload_process(process: subprocess.Popen[bytes]) -> None:
+def _stop_upload_process(process: UploadHandle) -> None:
     with suppress(ProcessLookupError):
         process.terminate()
     try:
@@ -72,7 +76,7 @@ def _stop_upload_process(process: subprocess.Popen[bytes]) -> None:
 
 def _toggle_upload_process(
     command: list[str], torrent_hash: str, *, cancel_running: bool = True
-) -> tuple[subprocess.Popen[bytes] | None, str]:
+) -> tuple[UploadHandle | None, str]:
     upload_key = torrent_hash.lower()
     with _upload_lock:
         if _server_stopping.is_set():
@@ -91,7 +95,12 @@ def _toggle_upload_process(
 
         if not ALLOW_CONCURRENT_UPLOADS and _active_upload_processes:
             return None, "busy"
-        process = subprocess.Popen(command, cwd=PROJECT_ROOT, env={**os.environ, "UA_REPORT_UPLOAD_SUCCESS": "1"})
+        if _upload_pool is None:
+            process = subprocess.Popen(command, cwd=PROJECT_ROOT, env={**os.environ, "UA_REPORT_UPLOAD_SUCCESS": "1"})
+        else:
+            process = _upload_pool.submit(command[2:])
+            if process is None:
+                return None, "busy"
         _completed_upload_hashes.pop(upload_key, None)
         _active_upload_processes[upload_key] = process
         _submitted_upload_hashes.add(upload_key)
@@ -225,16 +234,42 @@ def upload_hash():
         app.logger.exception("Could not start or cancel Upload Assistant")
         return jsonify(success=False, error="Could not start or cancel Upload Assistant"), 500
     if process is None:
+        if status == "busy" and _upload_pool is not None and ALLOW_CONCURRENT_UPLOADS:
+            return jsonify(success=False, error="All upload workers are busy; retry later"), 409
         return jsonify(success=False, error="An upload is already running"), 409
 
     return jsonify(success=True, status=status, hash=torrent_hash, pid=process.pid), 200 if status == "cancelled" else 202
 
 
+def _start_upload_pool(workers: int) -> UploadPool | None:
+    if workers == 0:
+        return None
+    from src.app_paths import CONFIG_PATH, bundled_example_config_path, ensure_legacy_config_absent, ensure_user_config
+    from src.config_sync import ConfigSyncError, sync_user_config
+
+    ensure_legacy_config_absent()
+    if ensure_user_config():
+        raise OSError(f"Configuration created at {CONFIG_PATH}; configure it before starting upload workers")
+    try:
+        result = sync_user_config(CONFIG_PATH, bundled_example_config_path())
+        if result.changed:
+            app.logger.info("Configuration updated with %s new settings; backup: %s", len(result.added_paths), result.backup_path)
+    except (ConfigSyncError, OSError) as exc:
+        app.logger.warning("Configuration was not automatically updated: %s", exc)
+    pool = UploadPool(workers)
+    app.logger.info("Warming %s upload workers; Python modules are loaded once in the preload process", workers)
+    pool.start()
+    app.logger.info("%s upload workers ready", workers)
+    return pool
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    global _upload_pool
     parser = argparse.ArgumentParser(description="Upload qBittorrent torrents by hash over HTTP or by watching tags.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     parser.add_argument("--poll-interval", type=int, default=5, help="Seconds between Upload tag checks (default: 5)")
+    parser.add_argument("--workers", type=int, default=5, help="Warm upload slots (default: 5; 0 uses a new Python interpreter per upload)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--no-tag-watch", action="store_true", help="Disable polling the default qBittorrent client for the Upload tag")
     mode.add_argument("--watch-only", action="store_true", help="Watch Upload tags without starting the HTTP listener")
@@ -242,12 +277,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be greater than zero")
+    if args.workers < 0:
+        parser.error("--workers must be zero or greater")
     app.logger.setLevel(logging.INFO)
     _server_stopping.clear()
     stop = threading.Event()
     watcher = None
     previous_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
     try:
+        try:
+            _upload_pool = _start_upload_pool(args.workers)
+        except (OSError, RuntimeError, ValueError) as exc:
+            app.logger.error("Could not start upload workers: %s", exc)
+            return 1
         if args.watch_only:
             _run_tag_watcher(stop, args.poll_interval, args.existing_tagged)
         else:
@@ -263,6 +305,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if watcher is not None:
             watcher.join(timeout=5)
         _shutdown_uploads()
+        if _upload_pool is not None:
+            _upload_pool.close()
+            _upload_pool = None
         signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
 

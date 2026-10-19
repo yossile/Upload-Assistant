@@ -6,6 +6,31 @@ Run the standalone server from the repository root. The default bind address is 
 python hash_upload_server.py --port 8765
 ```
 
+## Warm Upload Workers
+
+By default, the server warms **five upload workers before accepting requests or watching tags**. Python dependencies and uploader modules load once in a separate preload process. Ready workers inherit those cached modules rather than starting a fresh Python interpreter for each torrent.
+
+Each worker handles one upload and then exits. The pool automatically replaces it from the preloaded process, preserving fresh globals, event loops, and cleanup state for every job without repeating the expensive imports. Cancelled or crashed workers are replaced the same way. The HTTP response's PID belongs to the assigned upload worker, not the preload process.
+
+Change the number of warm slots with `--workers`:
+
+```bash
+python hash_upload_server.py --workers 5
+python hash_upload_server.py --watch-only --workers 3
+```
+
+When all slots are occupied or replacements are still becoming ready, HTTP submissions receive `409` and must be retried. Tagged torrents are retried on subsequent polls. Requests are not queued. Per-upload work such as configuration reload, update checks, qBittorrent requests, and download waiting still runs for each job. Restart the server after changing application code so the preload process uses the new modules.
+
+Warm workers require Python's `forkserver` support, available on Linux. On platforms without it, or to restore the original subprocess-per-upload behavior, use:
+
+```bash
+python hash_upload_server.py --workers 0
+```
+
+Worker warm-up is paid once at server startup. Initialization failures stop startup rather than silently falling back to slow uploads. Shutdown also stops idle workers and workers still warming up.
+
+## Tag Watching
+
 To only watch qBittorrent tags without opening an HTTP listener, use `--watch-only`:
 
 ```bash
@@ -44,7 +69,7 @@ python hash_upload_server.py --poll-interval 10
 python hash_upload_server.py --no-tag-watch
 ```
 
-The interval is the wait between completed polling passes, not a deadline for detecting a tag. Slow qBittorrent requests, completion retagging, or cancellations can extend it. The startup confirmation prompt also pauses polling until answered. The server logs `Started upload for tagged torrent <hash>` immediately after launching each tagged upload; the child uploader's own progress may appear later while it initializes and resolves the hash. Use the server's launch message to distinguish polling delays from uploader startup delays.
+The interval is the wait between completed polling passes, not a deadline for detecting a tag. Slow qBittorrent requests, completion retagging, or cancellations can extend it. The startup confirmation prompt also pauses polling until answered. The server logs `Started upload for tagged torrent <hash>` immediately after dispatching each tagged upload. With warm workers, module imports have already finished; per-upload initialization and hash resolution still follow. Use the server's launch message to distinguish polling delays from uploader startup delays.
 
 If the default client is not qBittorrent or watcher initialization fails, HTTP uploads remain available. Temporary polling failures are retried on the next interval.
 
@@ -66,7 +91,7 @@ The server passes the hash as `upload.py`'s positional input and adds `--unatten
 curl "http://127.0.0.1:8765/upload?hash=0123456789abcdef0123456789abcdef01234567&debug=true"
 ```
 
-Upload Assistant resolves the hash through the configured qBittorrent search client. The request returns HTTP `202` as soon as the process starts, with its PID; it does not wait for the upload to finish. A successful response means the process started, not that the upload eventually succeeded. A process-start failure returns HTTP `500`.
+Upload Assistant resolves the hash through the configured qBittorrent search client. The request returns HTTP `202` as soon as a worker accepts the job (or a subprocess starts with `--workers 0`), with its PID; it does not wait for the upload to finish. A successful response means the upload was dispatched, not that it eventually succeeded. Dispatch failures return HTTP `500`.
 
 Send a request with the same hash again while its upload is running to cancel it. Requests match only by hash (case-insensitive), regardless of debug mode. The `debug` parameter only affects logging when starting an upload. Cancellation returns HTTP `200` after the process stops:
 
@@ -76,6 +101,6 @@ Send a request with the same hash again while its upload is running to cancel it
 
 The server terminates the upload process and forcibly kills it if it does not exit within five seconds. Cancellation stops the running process; it does not undo uploads already submitted to trackers. Sending the request after cancellation or after the process has finished starts a new upload. Process-start and cancellation failures return HTTP `500`.
 
-Concurrent uploads are enabled by default. Set `ALLOW_CONCURRENT_UPLOADS = False` near the top of `hash_upload_server.py` and restart the server to allow only one upload at a time. In that mode, a different request receives HTTP `409` while an upload is running, but a matching request still cancels it. Requests are not queued. Active uploads are tracked only by the server process that started them.
+Concurrent uploads are enabled by default, limited to five warm slots unless `--workers` changes that limit. With `--workers 0`, there is no pool-imposed concurrency limit. Set `ALLOW_CONCURRENT_UPLOADS = False` near the top of `hash_upload_server.py` and restart the server to allow only one upload at a time. In that mode, a different request receives HTTP `409` while an upload is running, but a matching request still cancels it. Requests are not queued. Active uploads are tracked only by the server process that started them.
 
 The server has no authentication. Binding to `0.0.0.0` can expose the upload endpoint to other machines on reachable networks; use it only behind appropriate network access controls.
