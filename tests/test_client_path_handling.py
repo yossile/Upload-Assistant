@@ -337,7 +337,8 @@ async def test_resolve_qbittorrent_hash_does_not_search_unselected_clients(searc
 
 
 @pytest.mark.asyncio
-async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -> None:
+@pytest.mark.parametrize("wait_fails", [False, True])
+async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path, wait_fails: bool) -> None:
     media = tmp_path / "downloads" / "Release" / "movie.mkv"
     media.parent.mkdir(parents=True)
     media.write_bytes(b"media")
@@ -371,16 +372,27 @@ async def test_resolve_qbittorrent_hash_waits_by_supplied_hash(tmp_path: Path) -
         patch.object(clients, "init_qbittorrent_client", AsyncMock(return_value=qbt_client)) as init_client,
         patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
         patch("src.pre_upload_screenshots.prepare_tracker_screenshots", AsyncMock()) as prepare_screenshots,
+        patch("src.trackers.GAZELLE.passthepopcorn.PassThePopcorn.start_auth_prefetch") as start_auth,
+        patch("src.trackers.GAZELLE.passthepopcorn.PassThePopcorn.cancel_auth_prefetch", AsyncMock()) as cancel_auth,
     ):
         async def check_screenshots_prepared(*_args):
+            start_auth.assert_called_once_with(meta, clients.config)
             screenshot_meta, screenshot_config, tracker_ids = prepare_screenshots.await_args.args
             assert screenshot_meta.uuid == "movie.mkv"
             assert screenshot_config is clients.config
             assert tracker_ids == {"aither": "123"}
+            if wait_fails:
+                raise RuntimeError("download failed")
 
         wait_for_download.side_effect = check_screenshots_prepared
         meta = Meta()
+        if wait_fails:
+            with pytest.raises(RuntimeError, match="download failed"):
+                await clients.resolve_qbittorrent_hash_path(meta, infohash)
+            cancel_auth.assert_awaited_once_with(meta)
+            return
         resolved = await clients.resolve_qbittorrent_hash_path(meta, infohash)
+        cancel_auth.assert_not_awaited()
 
     assert resolved == str(media)
     assert meta.source_torrent_hash == infohash
@@ -725,7 +737,8 @@ async def test_preflight_skips_name_search_for_hash_input() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("wait_fails", [False, True])
+async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path, wait_fails: bool) -> None:
     content_path = tmp_path / "Release"
     client_config = {"torrent_client": "qbit", "enable_search": True}
     clients = Clients(
@@ -751,12 +764,23 @@ async def test_preflight_path_input_waits_for_matching_torrent(tmp_path: Path) -
         patch.object(clients, "_wait_for_qbittorrent_download", AsyncMock()) as wait_for_download,
         patch.object(clients, "_start_hash_metadata_prefetch") as start_prefetch,
         patch("src.pre_upload_screenshots.prepare_tracker_screenshots", AsyncMock()) as prepare_screenshots,
+        patch("src.trackers.GAZELLE.passthepopcorn.PassThePopcorn.start_auth_prefetch") as start_auth,
+        patch("src.trackers.GAZELLE.passthepopcorn.PassThePopcorn.cancel_auth_prefetch", AsyncMock()) as cancel_auth,
     ):
         async def check_screenshots_prepared(*_args):
+            start_auth.assert_called_once_with(meta, clients.config)
             prepare_screenshots.assert_awaited_once_with(meta, clients.config, {"aither": "123"})
+            if wait_fails:
+                raise RuntimeError("download failed")
 
         wait_for_download.side_effect = check_screenshots_prepared
-        await clients.preflight_qbittorrent_search(meta, [])
+        if wait_fails:
+            with pytest.raises(RuntimeError, match="download failed"):
+                await clients.preflight_qbittorrent_search(meta, [])
+            cancel_auth.assert_awaited_once_with(meta)
+        else:
+            await clients.preflight_qbittorrent_search(meta, [])
+            cancel_auth.assert_not_awaited()
 
     fetch_results.assert_awaited_once()
     wait_for_download.assert_awaited_once_with(client_config, torrent_hash)

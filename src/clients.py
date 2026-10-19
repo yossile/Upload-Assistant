@@ -908,7 +908,9 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                         prefetch_task = self._start_hash_metadata_prefetch(meta, torrent_name_value, str(content_path), comment_tracker_ids)
                     try:
                         from src.pre_upload_screenshots import prepare_tracker_screenshots
+                        from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
+                        PassThePopcorn.start_auth_prefetch(meta, self.config)
                         screenshot_meta = meta.copy()
                         screenshot_meta.uuid = Path(resolved_path).name
                         await prepare_tracker_screenshots(screenshot_meta, self.config, comment_tracker_ids)
@@ -920,11 +922,15 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                             key = (str(meta.base_dir), infohash.lower())
                             self._hash_metadata_prefetch_tasks[key] = (prefetch_task, meta.copy(), str(torrent_name_value), dict(comment_tracker_ids))
                     except BaseException:
+                        await PassThePopcorn.cancel_auth_prefetch(meta)
                         if prefetch_task is not None and not prefetch_task.done():
                             prefetch_task.cancel()
                             await asyncio.gather(prefetch_task, return_exceptions=True)
                         raise
                 if not Path(resolved_path).exists():
+                    from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
+
+                    await PassThePopcorn.cancel_auth_prefetch(meta)
                     if prefetch_task is not None:
                         prefetch_task.cancel()
                         await asyncio.gather(prefetch_task, return_exceptions=True)

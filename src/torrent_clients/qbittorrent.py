@@ -179,10 +179,16 @@ class QbittorrentClientMixin:
         if wait_candidates and not has_completed_match:
             client, torrent_hash, torrent = wait_candidates[0]
             from src.pre_upload_screenshots import prepare_tracker_screenshots
+            from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
-            tracker_ids = self._extract_tracker_ids_from_comment(str(getattr(torrent, "comment", "") or ""))
-            await prepare_tracker_screenshots(meta, self.config, tracker_ids)
-            await self._wait_for_qbittorrent_download(client, torrent_hash)
+            PassThePopcorn.start_auth_prefetch(meta, self.config)
+            try:
+                tracker_ids = self._extract_tracker_ids_from_comment(str(getattr(torrent, "comment", "") or ""))
+                await prepare_tracker_screenshots(meta, self.config, tracker_ids)
+                await self._wait_for_qbittorrent_download(client, torrent_hash)
+            except BaseException:
+                await PassThePopcorn.cancel_auth_prefetch(meta)
+                raise
 
     async def _wait_for_qbittorrent_download(self, client: dict[str, Any], torrent_hash: str) -> None:
         proxy_url_value = client.get("qui_proxy_url")

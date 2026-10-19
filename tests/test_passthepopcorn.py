@@ -193,6 +193,113 @@ async def test_early_group_lookup_is_noninteractive_and_cancelled(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["fresh", "expired", "failed", "empty", "cancelled"])
+async def test_auth_prefetch_reuses_only_fresh_success(monkeypatch, outcome):
+    import time
+
+    tracker = object.__new__(PassThePopcorn)
+    token = AsyncMock(return_value="early-token" if outcome != "empty" else "")
+    if outcome == "failed":
+        token.side_effect = RuntimeError("authentication unavailable")
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    monkeypatch.setattr(PassThePopcorn, "get_anti_csrf_token", token)
+    meta = Meta(base_dir="test-auth-prefetch", source_torrent_hash="hash", unattended=True, trackers=["PTP"])
+    config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
+    PassThePopcorn.start_auth_prefetch(meta, config)
+    PassThePopcorn.start_auth_prefetch(meta, config)
+    task = PassThePopcorn._auth_prefetch_tasks[PassThePopcorn._prefetch_key(meta)]
+    if outcome == "cancelled":
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    if outcome == "expired":
+        expired_at = time.monotonic() + tracker._prefetch_max_age + 1
+        monkeypatch.setattr("src.trackers.GAZELLE.passthepopcorn.time.monotonic", lambda: expired_at)
+    tracker.get_anti_csrf_token = AsyncMock(return_value="fallback-token")
+
+    try:
+        expected = "early-token" if outcome == "fresh" else "fallback-token"
+        assert await tracker.get_upload_anti_csrf_token(meta) == expected  # noqa: S101
+        assert tracker.get_anti_csrf_token.await_count == (0 if outcome == "fresh" else 1)  # noqa: S101
+        assert token.await_count == (0 if outcome == "cancelled" else 1)  # noqa: S101
+        assert not PassThePopcorn._auth_prefetch_tasks  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+async def test_auth_prefetch_is_cancelled_with_other_ptp_prefetch(monkeypatch):
+    started = asyncio.Event()
+
+    async def authenticate(_self, _meta):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    monkeypatch.setattr(PassThePopcorn, "get_anti_csrf_token", authenticate)
+    meta = Meta(base_dir="test-auth-cancellation", uuid="release", unattended=True, trackers=["PASSTHEPOPCORN"])
+    PassThePopcorn.start_auth_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+    task = PassThePopcorn._auth_prefetch_tasks[PassThePopcorn._prefetch_key(meta)]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+    assert task.cancelled()  # noqa: S101
+    assert not PassThePopcorn._auth_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_auth_prefetch_survives_source_hash_discovery(monkeypatch):
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    token = AsyncMock(return_value="early-token")
+    monkeypatch.setattr(PassThePopcorn, "get_anti_csrf_token", token)
+    meta = Meta(base_dir="test-auth-path", uuid="release", unattended=True, trackers=["PASSTHEPOPCORN"])
+    PassThePopcorn.start_auth_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+    meta.source_torrent_hash = "discovered-hash"
+    tracker = object.__new__(PassThePopcorn)
+    try:
+        assert await tracker.get_upload_anti_csrf_token(meta) == "early-token"  # noqa: S101
+        token.assert_awaited_once()
+        assert not PassThePopcorn._auth_prefetch_tasks  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+async def test_upload_form_consumes_download_time_authentication(monkeypatch):
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    token = AsyncMock(return_value="early-token")
+    monkeypatch.setattr(PassThePopcorn, "get_anti_csrf_token", token)
+    meta = Meta(base_dir="test-auth-form", uuid="release", unattended=True, trackers=["PASSTHEPOPCORN"])
+    PassThePopcorn.start_auth_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+    tracker = object.__new__(PassThePopcorn)
+
+    async def form(_group_id, _meta, prerequisites):
+        return "url", {"AntiCsrfToken": await prerequisites["csrf"]}
+
+    tracker._fill_upload_form = form
+    tracker._prepare_upload_torrent = AsyncMock(return_value=b"torrent")
+    try:
+        result = await asyncio.wait_for(tracker.fill_upload_form("1234", meta), timeout=2)
+        assert result == ("url", {"AntiCsrfToken": "early-token"})  # noqa: S101
+        token.assert_awaited_once()
+        assert not PassThePopcorn._auth_prefetch_tasks  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"trackers": ["AITHER"]}, {"unattended": False}, {"unattended_confirm": True}, {"debug": True}, {"edit": True}])
+async def test_auth_prefetch_skips_ineligible_uploads(overrides):
+    meta = Meta(base_dir="test-auth-skipped", uuid="release", unattended=True, trackers=["PASSTHEPOPCORN"])
+    meta.update(overrides)
+
+    PassThePopcorn.start_auth_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+
+    assert PassThePopcorn._prefetch_key(meta) not in PassThePopcorn._auth_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
 async def test_form_and_torrent_preparation_overlap_and_cache_bytes():
     tracker = object.__new__(PassThePopcorn)
     torrent_started = asyncio.Event()

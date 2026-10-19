@@ -47,6 +47,9 @@
   - Your custom announce url
   - Most commonly found on the site's upload page
 
+- PTP download-time authentication: when PTP is selected for an unattended upload without confirmation, authentication and CSRF-token retrieval start in the background while waiting for an incomplete qBittorrent source torrent (path or hash input).
+  - No extra setting is needed. A successful token is kept only in memory for that release and reused for up to one hour; failed or expired results fall back to normal upload-time authentication. Debug and edit modes do not authenticate early, and interactive/2FA prompts are not shown in the background.
+
 - Draft Default: `draft_default`
   - If the site has a draft system, setting `True` will send to drafts by default
   - Setting `False` will go live by default

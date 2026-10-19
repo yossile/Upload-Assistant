@@ -146,6 +146,7 @@ class PassThePopcorn:
     _prefetch_max_age = 3600.0
     _group_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[tuple[str, str], float, asyncio.Task[str | None]]]] = {}
     _title_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[Meta, float, asyncio.Task[dict[str, Any] | None]]]] = {}
+    _auth_prefetch_tasks: ClassVar[dict[tuple[str, str], asyncio.Task[tuple[str, float] | None]]] = {}
 
     @staticmethod
     def _prefetch_key(meta: Meta) -> tuple[str, str]:
@@ -262,7 +263,57 @@ class PassThePopcorn:
             await asyncio.gather(task, return_exceptions=True)
 
     @classmethod
+    def start_auth_prefetch(cls, meta: Meta, config: dict[str, Any]) -> None:
+        selected = meta.trackers or config.get("TRACKERS", {}).get("default_trackers", "")
+        selected = selected.split(",") if isinstance(selected, str) else selected
+        if (
+            not meta.unattended
+            or meta.unattended_confirm
+            or meta.edit
+            or meta.debug
+            or not any(Meta.canonical_tracker_name(str(tracker).strip()) == cls.tracker for tracker in selected)
+            or not config.get("TRACKERS", {}).get(cls.tracker)
+        ):
+            return
+        key = cls._prefetch_key(meta)
+        if key in cls._auth_prefetch_tasks:
+            return
+        snapshot = meta.copy()
+
+        async def authenticate() -> tuple[str, float] | None:
+            try:
+                started_at = time.perf_counter()
+                token = await cls(config).get_anti_csrf_token(snapshot)
+                log_ptp_timing(snapshot, "early session and CSRF token", started_at)
+                return (token, time.monotonic()) if token else None
+            except Exception:
+                logger.debug(f"{cls.tracker}: Early authentication failed; authentication will be retried at upload time.")
+                return None
+
+        cls._auth_prefetch_tasks[key] = asyncio.create_task(authenticate())
+
+    @classmethod
+    async def cancel_auth_prefetch(cls, meta: Meta) -> None:
+        keys = {cls._prefetch_key(meta), (str(meta.base_dir), str(meta.uuid))}
+        for key in keys:
+            task = cls._auth_prefetch_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def get_upload_anti_csrf_token(self, meta: Meta) -> str:
+        task = self._auth_prefetch_tasks.pop(self._prefetch_key(meta), None)
+        if task is None:
+            task = self._auth_prefetch_tasks.pop((str(meta.base_dir), str(meta.uuid)), None)
+        if task is not None and not task.cancelled():
+            result = await task
+            if result is not None and time.monotonic() - result[1] < self._prefetch_max_age:
+                return result[0]
+        return await self.get_anti_csrf_token(meta)
+
+    @classmethod
     async def cancel_prefetch(cls, meta: Meta) -> None:
+        await cls.cancel_auth_prefetch(meta)
         await cls.cancel_title_prefetch(meta)
         await cls.cancel_group_prefetch(meta)
 
@@ -1645,7 +1696,7 @@ class PassThePopcorn:
                 log_ptp_timing(meta, stage, started_at)
 
         if meta.unattended and not meta.unattended_confirm:
-            prerequisites["csrf"] = asyncio.create_task(timed("session and CSRF token", self.get_anti_csrf_token(meta)))
+            prerequisites["csrf"] = asyncio.create_task(timed("session and CSRF token", self.get_upload_anti_csrf_token(meta)))
             if group_id is None:
                 snapshot = meta.copy()
                 prerequisites["metadata"] = asyncio.create_task(timed("PTP title metadata lookup", self.get_title_info_for_meta(snapshot)))
@@ -1746,7 +1797,7 @@ class PassThePopcorn:
         if "csrf" in prerequisites:
             anti_csrf_token = await prerequisites["csrf"]
         else:
-            anti_csrf_token = await self.get_anti_csrf_token(meta)
+            anti_csrf_token = await self.get_upload_anti_csrf_token(meta)
             log_ptp_timing(meta, "session and CSRF token", csrf_started_at)
         data: dict[str, Any] = {
             "submit": "true",
