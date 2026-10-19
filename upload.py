@@ -5,7 +5,19 @@
 import contextlib
 import os
 import sys
+import time
 from pathlib import Path
+
+_startup_started = time.monotonic()
+
+
+def _report_hash_upload_startup(stage: str) -> None:
+    if os.environ.get("UA_REPORT_UPLOAD_SUCCESS") == "1":
+        elapsed = time.monotonic() - _startup_started
+        print(f"[Upload startup pid={os.getpid()} +{elapsed:.1f}s] {stage}", flush=True)
+
+
+_report_hash_upload_startup("Initializing Upload Assistant")
 
 from src.app_paths import CONFIG_PATH, LegacyConfigLocationError, bundled_example_config_path, ensure_legacy_config_absent, ensure_user_config
 from src.config_sync import ConfigSyncError, sync_user_config
@@ -50,6 +62,7 @@ if _is_uploader_entrypoint:
             print("Configure it before running an upload, then run the command again.")
             sys.exit(1)
     else:
+        _report_hash_upload_startup("Synchronizing configuration schema")
         try:
             _config_sync_result = sync_user_config(CONFIG_PATH, bundled_example_config_path())
         except (ConfigSyncError, OSError) as exc:
@@ -69,7 +82,6 @@ import shlex
 import shutil
 import signal
 import threading
-import time
 import traceback
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -78,7 +90,10 @@ from urllib.parse import urljoin, urlparse
 
 from src.check_requirements import check_dependencies
 
+_report_hash_upload_startup("Checking Python dependencies")
 check_dependencies()
+
+_report_hash_upload_startup("Loading upload modules")
 
 import logging
 
@@ -2225,6 +2240,7 @@ def load_heavy_globals() -> None:
 
 async def do_the_thing(base_dir: str) -> None:
     global _upload_succeeded, _upload_dupe
+    _report_hash_upload_startup("Upload modules loaded; initializing runtime")
     webui_roots = subprocess_roots()
     if webui_roots is not None:
         validate_argument_paths(sys.argv[2:], webui_roots)
@@ -2233,6 +2249,7 @@ async def do_the_thing(base_dir: str) -> None:
 
     reset_api_key_expiry_warnings()
     load_heavy_globals()
+    _report_hash_upload_startup("Reloading configuration")
     # Reload config from disk so that changes made via the WebUI config
     # editor (or manual file edits between runs) are picked up.  The
     # module-level ``config`` dict is imported once at startup and would
@@ -2254,10 +2271,12 @@ async def do_the_thing(base_dir: str) -> None:
         logger.warning(f"[yellow]Warning: could not reload config from disk: {exc}[/yellow]")
 
     configure_stats(config)
+    _report_hash_upload_startup("Runtime configuration loaded")
 
     from src.prowlarr import ProwlarrError, apply_prowlarr_credentials, configured_prowlarr, fetch_prowlarr_credentials
 
     if prowlarr_connection := configured_prowlarr(config):
+        _report_hash_upload_startup("Syncing Prowlarr credentials")
         prowlarr_started = time.monotonic()
         try:
             report = await asyncio.to_thread(
@@ -2272,6 +2291,7 @@ async def do_the_thing(base_dir: str) -> None:
         except ProwlarrError as exc:
             await record_event_async("api", service="prowlarr", operation="credential_sync", outcome="error", duration_ms=(time.monotonic() - prowlarr_started) * 1000)
             logger.warning(f"[yellow]Prowlarr credential fallback unavailable: {exc}[/yellow]")
+        _report_hash_upload_startup("Prowlarr credential sync finished")
 
     await asyncio.sleep(0.1)  # Ensure it's not racing
 
@@ -2322,7 +2342,9 @@ async def do_the_thing(base_dir: str) -> None:
             break
 
     meta.ua_name = "Upload-Assistant"
+    _report_hash_upload_startup("Checking for updates (returns immediately if disabled)")
     meta.current_version = await update_notification()
+    _report_hash_upload_startup("Update check finished; parsing arguments and validating configuration")
 
     signature = f"Shared with {meta.ua_name}"
     if meta.current_version:
@@ -2471,6 +2493,7 @@ async def do_the_thing(base_dir: str) -> None:
             enable_console_timestamps()
 
         if meta.path and not Path(meta.path).expanduser().exists() and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", meta.path):
+            _report_hash_upload_startup(f"Looking up torrent hash {meta.path} in qBittorrent")
             try:
                 resolved_path = await Clients(config).resolve_qbittorrent_hash_path(meta, meta.path)
             except ValueError as exc:

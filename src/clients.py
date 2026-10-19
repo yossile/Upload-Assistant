@@ -817,6 +817,13 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
     async def resolve_qbittorrent_hash_path(self, meta: Meta, infohash: str) -> str | None:
         """Resolve a qBittorrent hash to its locally accessible content path."""
+        lookup_started = time.monotonic()
+
+        def report_lookup(stage: str) -> None:
+            if os.environ.get("UA_REPORT_UPLOAD_SUCCESS") == "1":
+                elapsed = time.monotonic() - lookup_started
+                print(f"[Hash lookup pid={os.getpid()} hash={infohash} +{elapsed:.1f}s] {stage}", flush=True)
+
         default_config = cast(dict[str, Any], self.config.get("DEFAULT", {}))
         clients_config = cast(dict[str, Any], self.config.get("TORRENT_CLIENTS", {}))
         requested_client = meta.client
@@ -836,6 +843,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
             proxy_url = client_value.get("qui_proxy_url")
             if proxy_url:
+                report_lookup("Requesting torrent information via proxy")
                 try:
                     ssl_context = self.create_ssl_context_for_client(client_value)
                     async with httpx.AsyncClient(timeout=10.0, verify=ssl_context) as session:
@@ -851,9 +859,11 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                     logger.info(f"[bold red]qBittorrent hash lookup failed via proxy for client '{client_name}': {exc}")
                     continue
             else:
+                report_lookup("Connecting and authenticating to qBittorrent")
                 qbt_client = await self.init_qbittorrent_client(client_value)
                 if qbt_client is None:
                     continue
+                report_lookup("Requesting torrent information")
                 try:
                     torrents = await self.retry_qbt_operation(
                         lambda qbt_client=qbt_client: asyncio.to_thread(qbt_client.torrents_info, torrent_hashes=infohash),
@@ -863,6 +873,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                     logger.info(f"[bold red]qBittorrent hash lookup failed for client '{client_name}': {exc}")
                     continue
 
+            report_lookup("Torrent information received")
             if not isinstance(torrents, Sequence):
                 continue
             for torrent in cast(Sequence[Any], torrents):
@@ -871,6 +882,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                 if str(torrent_hash).lower() != infohash.lower():
                     continue
 
+                report_lookup("Matching torrent found; reading comments and mapping content path")
                 content_path = torrent_data.get("content_path", "") if torrent_data is not None else getattr(torrent, "content_path", "")
                 if not content_path:
                     save_path = torrent_data.get("save_path", "") if torrent_data is not None else getattr(torrent, "save_path", "")
@@ -902,6 +914,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                 resolved_path = str(Path(local_path).expanduser().resolve())
                 prefetch_task: asyncio.Task[Meta] | None = None
                 if not self._qbit_torrent_is_complete(torrent):
+                    report_lookup("Torrent incomplete; starting metadata and screenshot preparation")
                     meta.source_torrent_hash = infohash
                     torrent_name_value = torrent_data.get("name") if torrent_data is not None else getattr(torrent, "name", None)
                     if isinstance(torrent_name_value, str) and torrent_name_value:
@@ -917,6 +930,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                         meta.image_list = screenshot_meta.image_list
                         meta.image_sizes = screenshot_meta.image_sizes
                         meta.imghost = screenshot_meta.imghost
+                        report_lookup("Screenshot preparation finished; waiting for download completion")
                         await self._wait_for_qbittorrent_download(client_value, infohash)
                         if prefetch_task is not None:
                             key = (str(meta.base_dir), infohash.lower())
@@ -927,6 +941,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                             prefetch_task.cancel()
                             await asyncio.gather(prefetch_task, return_exceptions=True)
                         raise
+                report_lookup("Checking local content path exists")
                 if not Path(resolved_path).exists():
                     from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
 
@@ -938,6 +953,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
                     raise ValueError(f"Resolved local content path does not exist: {resolved_path}")
                 meta.source_torrent_hash = infohash
                 meta.source_torrent_client = client_name
+                report_lookup("Hash resolution finished")
                 logger.info(f"[green]Resolved torrent hash {infohash} to {resolved_path} using client '{client_name}'")
                 return resolved_path
 
