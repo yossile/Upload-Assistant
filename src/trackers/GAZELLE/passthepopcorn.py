@@ -1387,7 +1387,7 @@ class PassThePopcorn:
                             new_screens = [f.name for f in screenshots_dir(meta.base_dir, meta.uuid).glob(f"{glob.escape(meta.discs[i]['name'])}-*.png")]
                             if not new_screens:
                                 try:
-                                    await self.takescreens_manager.dvd_screenshots(meta, i, multi_screens, True)
+                                    await self.takescreens_manager.dvd_screenshots(meta, i, multi_screens, True, cleanup_after_capture=False)
                                 except Exception as e:
                                     logger.info(f"{self.tracker}: Error during DVD screenshot capture: {e}", extra={"markup": False})
                             new_screens = [f.name for f in screenshots_dir(meta.base_dir, meta.uuid).glob(f"{glob.escape(meta.discs[i]['name'])}-*.png")]
@@ -1511,7 +1511,7 @@ class PassThePopcorn:
                         if not new_screens:
                             try:
                                 await self.takescreens_manager.screenshots(
-                                    file, f"FILE_{i}", meta.uuid, meta.base_dir, meta, multi_screens, True, "", capture_group=f"FILE_{i}"
+                                    file, f"FILE_{i}", meta.uuid, meta.base_dir, meta, multi_screens, True, "", cleanup_after_capture=False, capture_group=f"FILE_{i}"
                                 )
                             except Exception as e:
                                 logger.info(f"{self.tracker}: Error during generic screenshot capture: {e}", extra={"markup": False})

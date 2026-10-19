@@ -325,6 +325,36 @@ async def test_form_and_torrent_preparation_overlap_and_cache_bytes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["files", "dvd"])
+async def test_multifile_description_capture_does_not_cancel_upload(monkeypatch, tmp_path, media_kind):
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {"DEFAULT": {}}
+    tracker.web_source = False
+    tracker.approved_image_hosts = []
+    capture = AsyncMock()
+    tracker.takescreens_manager = SimpleNamespace(screenshots=capture, dvd_screenshots=capture)
+    meta = Meta(
+        base_dir=str(tmp_path),
+        uuid="release",
+        filelist=["first.mkv", "second.mkv"],
+        image_list=[],
+        retry_count=0,
+    )
+    if media_kind == "dvd":
+        meta.discs = [{"type": "DVD", "name": name, "ifo_mi_full": "IFO", "vob_mi_full": "VOB"} for name in ("first", "second")]
+    release_dir = tmp_path / "tmp" / meta.uuid
+    release_dir.mkdir(parents=True)
+    (release_dir / "MEDIAINFO.txt").write_text("First MediaInfo", encoding="utf-8")
+    monkeypatch.setattr("src.description_review.get_base_description", lambda _meta: "")
+    monkeypatch.setattr("src.trackers.GAZELLE.passthepopcorn.MediaInfo.parse", lambda *_args, **_kwargs: "Second MediaInfo")
+
+    await tracker.edit_desc(meta)
+
+    capture.assert_awaited_once()
+    assert capture.call_args.kwargs["cleanup_after_capture"] is False  # noqa: S101
+
+
+@pytest.mark.asyncio
 async def test_form_failure_cancels_torrent_preparation():
     tracker = object.__new__(PassThePopcorn)
     torrent_started = asyncio.Event()

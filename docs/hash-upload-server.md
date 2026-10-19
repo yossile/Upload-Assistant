@@ -44,6 +44,8 @@ python hash_upload_server.py --poll-interval 10
 python hash_upload_server.py --no-tag-watch
 ```
 
+The interval is the wait between completed polling passes, not a deadline for detecting a tag. Slow qBittorrent requests, completion retagging, or cancellations can extend it. The startup confirmation prompt also pauses polling until answered. The server logs `Started upload for tagged torrent <hash>` immediately after launching each tagged upload; the child uploader's own progress may appear later while it initializes and resolves the hash. Use the server's launch message to distinguish polling delays from uploader startup delays.
+
 If the default client is not qBittorrent or watcher initialization fails, HTTP uploads remain available. Temporary polling failures are retried on the next interval.
 
 Choose a different bind address with `--host`, for example `0.0.0.0` to listen on all interfaces:

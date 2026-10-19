@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
@@ -152,6 +153,23 @@ def test_main_passes_host_and_port_to_server(monkeypatch: pytest.MonkeyPatch) ->
     assert server.main(["--host", "0.0.0.0", "--port", "9000", "--no-tag-watch"]) == 0
 
     assert run_args == [{"host": "0.0.0.0", "port": 9000}]
+
+
+def test_main_enables_upload_start_logs(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setattr(server.app.logger, "level", logging.NOTSET)
+    monkeypatch.setattr(logging.getLogger(), "level", logging.WARNING)
+    monkeypatch.setattr(server, "_run_tag_watcher", Mock())
+    client = Mock()
+    client.torrents_info.return_value = [SimpleNamespace(hash="a" * 40)]
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(server.app, "run", lambda **_kwargs: server._poll_upload_tag(client))
+
+    assert server.main(["--no-tag-watch"]) == 0
+
+    assert server.app.logger.isEnabledFor(logging.INFO)
+    assert f"Started upload for tagged torrent {'a' * 40}" in caplog.text
 
 
 @pytest.mark.parametrize("interrupt", [False, True])

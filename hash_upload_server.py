@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import re
 import signal
@@ -241,6 +242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be greater than zero")
+    app.logger.setLevel(logging.INFO)
     _server_stopping.clear()
     stop = threading.Event()
     watcher = None
