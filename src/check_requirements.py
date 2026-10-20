@@ -1,51 +1,17 @@
 # Upload Assistant © 2026 Audionut & wastaken7 — Licensed under UAPL v1.0
-import contextlib
-import hashlib
 import importlib.metadata
-import json
 import logging
 import sys
 from pathlib import Path
 
-from src.app_paths import STATE_DIR
-
 logger = logging.getLogger(__name__)
-DEPENDENCY_CACHE_PATH = STATE_DIR / "cache" / "dependency-check.json"
 
 
-def _dependency_fingerprint(requirements_file: Path) -> str | None:
-    try:
-        paths = [Path(sys.executable), *(Path(entry or ".") for entry in sys.path)]
-        stamps: list[tuple[str, None] | tuple[str, int, int, int, int]] = []
-        for path in paths:
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                stamps.append((str(path.absolute()), None))
-            else:
-                stamps.append((str(path.absolute()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
-        state: list[object] = [1, sys.version, sys.prefix, sys.base_prefix, stamps, requirements_file.read_text(encoding="utf-8")]
-        return hashlib.sha256(json.dumps(state).encode("utf-8")).hexdigest()
-    except (OSError, UnicodeError):
-        return None
-
-
-def _dependencies_cached(fingerprint: str | None) -> bool:
-    if fingerprint is None:
-        return False
-    try:
-        return json.loads(DEPENDENCY_CACHE_PATH.read_text(encoding="utf-8")) == fingerprint
-    except (OSError, ValueError, UnicodeError):
-        return False
-
-
-def check_dependencies(*, force: bool = False) -> None:
+def check_dependencies() -> None:
     """
     Checks if the Python version is correct and if the dependencies listed in requirements.txt are installed.
     If the Python version is unsupported or packages are missing, it outputs a clear warning and exits.
     If versions mismatch, it prints a warning but allows execution to continue.
-    Successful checks are cached until requirements, Python, or import-directory
-    timestamps change. Pass force=True after editing installed metadata in place.
     """
     # Verify Python version
     required_version = (3, 14)
@@ -60,12 +26,6 @@ def check_dependencies(*, force: bool = False) -> None:
     requirements_file = Path(__file__).resolve().parent.parent / "requirements.txt"
     if not requirements_file.exists():
         return
-
-    fingerprint = _dependency_fingerprint(requirements_file)
-    if not force and _dependencies_cached(fingerprint):
-        return
-    with contextlib.suppress(OSError):
-        DEPENDENCY_CACHE_PATH.unlink(missing_ok=True)
 
     missing_packages: list[str] = []
     mismatched_versions: list[str] = []
@@ -152,9 +112,3 @@ def check_dependencies(*, force: bool = False) -> None:
         if missing_packages:
             print("\n\033[1;31mError: Execution halted due to missing packages.\033[0m\n")
             sys.exit(1)
-    elif fingerprint is not None:
-        try:
-            DEPENDENCY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            DEPENDENCY_CACHE_PATH.write_text(json.dumps(fingerprint), encoding="utf-8")
-        except OSError:
-            pass

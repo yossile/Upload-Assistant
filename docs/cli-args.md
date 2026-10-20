@@ -9,21 +9,6 @@ The WebUI argument picker reads available flags and help text from that same par
 - `-h` shows a short/curated help (common options only).
 - `--help` shows the full argparse help.
 
-## Startup dependency checks
-
-Successful dependency checks are cached under `cache/dependency-check.json` in the
-application state directory (`UA_DATA_DIR` when overridden). Unchanged CLI runs
-skip package-version lookups. Changes to requirements, the Python interpreter,
-or import-directory timestamps (such as a normal package install or removal)
-trigger another check. Missing or mismatched packages are not cached, and the
-minimum Python version is always checked.
-
-After manually editing installed package metadata in place, force a fresh check:
-
-```console
-python -c 'from src.check_requirements import check_dependencies; check_dependencies(force=True)'
-```
-
 ## Basic usage
 
 ```text
