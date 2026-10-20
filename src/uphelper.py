@@ -849,6 +849,8 @@ class UploadHelper:
                 cover_to_use = select_ptp_cover_url(meta)
                 if cover_to_use is not None:
                     lines.append(("PTP Cover", cover_to_use))
+                else:
+                    lines.append(("PTP Cover", _missing_with_hint(missing_warning, "No cover found in metadata. Use --poster with a cover URL.")))
             if meta.tvdb_id or 0 != 0:
                 lines.append(("TVDB", f"https://www.thetvdb.com/?id={meta.tvdb_id}&tab=series"))
             if meta.tvmaze_id or 0 != 0:

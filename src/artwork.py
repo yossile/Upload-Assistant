@@ -46,7 +46,7 @@ def select_ptp_cover_url(meta: Meta) -> str | None:
     for cover in (meta.imdb_info.get("cover"), meta.artwork_url):
         if isinstance(cover, str) and cover.strip():
             return cover
-    poster_path = meta.tmdb_poster_path.strip()
+    poster_path = (meta.tmdb_poster_path or "").strip()
     if poster_path:
         return f"https://image.tmdb.org/t/p/original{poster_path}"
     return None

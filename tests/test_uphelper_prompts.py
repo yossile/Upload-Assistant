@@ -276,6 +276,20 @@ async def test_video_confirmation_shows_explicit_ptp_cover(monkeypatch: pytest.M
     assert "https://image.tmdb.org/t/p/original/rp0n3G5v6vdkGvEz6djEeRwZ4fH.jpg" not in messages[0]
 
 
+@pytest.mark.parametrize("poster_path", [None, "", "   "])
+@pytest.mark.asyncio
+async def test_video_confirmation_explains_missing_ptp_cover(monkeypatch: pytest.MonkeyPatch, poster_path: str | None) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr("src.uphelper.logger.info", lambda message, **_kwargs: messages.append(message))
+    meta = Meta(category="MOVIE", tmdb_poster_path=poster_path, trackers=["PASSTHEPOPCORN"], unattended=True)
+
+    assert await UploadHelper({"DEFAULT": {}}).get_confirmation(meta) is True
+
+    cover_line = next(line for line in messages[0].splitlines() if "PTP Cover" in line)
+    assert "Missing" in cover_line
+    assert "No cover found in metadata. Use --poster with a cover URL." in cover_line
+
+
 @pytest.mark.parametrize(
     ("service_longname", "expected"),
     [("Storytel", "Storytel"), ("", "Not set. Use --service if applicable.")],
