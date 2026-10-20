@@ -1,37 +1,14 @@
 from __future__ import annotations
 
-import ast
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-from types import CodeType, FunctionType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
 import hash_upload_server as server
-
-
-@pytest.mark.parametrize("enabled", [True, False])
-def test_hash_upload_startup_reports_elapsed_time_and_flushes(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
-    module = ast.parse(server.UPLOAD_SCRIPT.read_text(encoding="utf-8"))
-    report_function = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "_report_hash_upload_startup")
-    if enabled:
-        monkeypatch.setenv("UA_REPORT_UPLOAD_SUCCESS", "1")
-    else:
-        monkeypatch.delenv("UA_REPORT_UPLOAD_SUCCESS", raising=False)
-    output = Mock()
-    namespace = {"os": server.os, "time": SimpleNamespace(monotonic=lambda: 12.5), "_startup_started": 10.0, "print": output}
-    module_code = compile(ast.Module(body=[report_function], type_ignores=[]), str(server.UPLOAD_SCRIPT), "exec")
-    function_code = next(constant for constant in module_code.co_consts if isinstance(constant, CodeType) and constant.co_name == report_function.name)
-    report_startup = FunctionType(function_code, namespace)
-
-    report_startup("Checking for updates")
-
-    if enabled:
-        output.assert_called_once_with(f"[Upload startup pid={server.os.getpid()} +2.5s] Checking for updates", flush=True)
-    else:
-        output.assert_not_called()
 
 
 @pytest.fixture(autouse=True)

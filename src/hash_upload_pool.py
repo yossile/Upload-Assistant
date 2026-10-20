@@ -27,10 +27,6 @@ def _worker_main(connection: Connection, uploader_module: str) -> None:
         project_root = Path(__file__).resolve().parent.parent
         os.chdir(project_root)
         sys.argv = [str(project_root / "upload.py"), *arguments]
-        uploader._startup_started = time.monotonic()
-        report_startup = getattr(uploader, "_report_hash_upload_startup", None)
-        if report_startup is not None:
-            report_startup("Using preloaded upload worker")
         uploader.run()
     except EOFError:
         return
