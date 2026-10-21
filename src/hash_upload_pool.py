@@ -8,30 +8,42 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib import import_module
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
+from multiprocessing.reduction import DupFd
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def _worker_main(connection: Connection, uploader_module: str) -> None:
-    try:
-        uploader = import_module(uploader_module)
-        connection.send("ready")
-        arguments = connection.recv()
-        connection.close()
-        os.environ["UA_REPORT_UPLOAD_SUCCESS"] = "1"
-        project_root = Path(__file__).resolve().parent.parent
-        os.chdir(project_root)
-        sys.argv = [str(project_root / "upload.py"), *arguments]
-        uploader.run()
-    except EOFError:
-        return
-    finally:
-        connection.close()
+def _worker_main(connection: Connection, uploader_module: str, shared_stdin: Any = None) -> None:
+    with ExitStack() as stdin_stack:
+        try:
+            if shared_stdin is not None:
+                stdin_fd = shared_stdin.detach()
+                try:
+                    sys.stdin.close()
+                    os.dup2(stdin_fd, 0)
+                finally:
+                    os.close(stdin_fd)
+                sys.stdin = stdin_stack.enter_context(open(0, encoding="utf-8", closefd=False))
+            uploader = import_module(uploader_module)
+            connection.send("ready")
+            arguments = connection.recv()
+            connection.close()
+            os.environ["UA_REPORT_UPLOAD_SUCCESS"] = "1"
+            project_root = Path(__file__).resolve().parent.parent
+            os.chdir(project_root)
+            sys.argv = [str(project_root / "upload.py"), *arguments]
+            uploader.run()
+        except EOFError:
+            return
+        finally:
+            connection.close()
 
 
 class UploadProcess:
@@ -98,10 +110,17 @@ class UploadPool:
 
     def _spawn(self) -> None:
         parent, child = self._context.Pipe()
-        process = self._context.Process(target=_worker_main, args=(child, self._uploader_module))
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdin_fd = None
+        shared_stdin = DupFd(stdin_fd) if stdin_fd is not None else None
+        process = self._context.Process(target=_worker_main, args=(child, self._uploader_module, shared_stdin))
         try:
             process.start()
         except BaseException:
+            if shared_stdin is not None:
+                os.close(shared_stdin.detach())
             parent.close()
             process.close()
             raise

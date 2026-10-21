@@ -12,6 +12,8 @@ By default, the server warms **five upload workers before accepting requests or 
 
 Each worker handles one upload and then exits. The pool automatically replaces it from the preloaded process, preserving fresh globals, event loops, and cleanup state for every job without repeating the expensive imports. Cancelled or crashed workers are replaced the same way. The HTTP response's PID belongs to the assigned upload worker, not the preload process.
 
+Worker uploads still receive `--unattended`, but inherit the server's stdin just like subprocess uploads. If a tracker still needs input, such as PTP's release-type selection, the worker waits for your answer in the server's terminal. Keep that terminal available for prompts. Without terminal or piped input, interactive prompts cannot be answered.
+
 Change the number of warm slots with `--workers`:
 
 ```bash

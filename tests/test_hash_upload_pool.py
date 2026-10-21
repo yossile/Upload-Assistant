@@ -25,6 +25,8 @@ def run() -> None:
         raise SystemExit(10 if _import_pid != os.getpid() and _job_count == 1 else 1)
     if sys.argv[1] == "block":
         threading.Event().wait()
+    if sys.argv[1] == "prompt":
+        raise SystemExit(10 if input("Worker answer: ") == "continue" else 1)
     raise SystemExit(int(sys.argv[1]))
 
 
@@ -57,6 +59,31 @@ def test_warm_pool_replenishes_isolated_jobs_and_reports_exit_codes() -> None:
         assert another.wait(timeout=10) == 10
     finally:
         pool.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Warm upload workers need forkserver")
+def test_worker_waits_for_input_from_server_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, encoding="utf-8") as stdin, os.fdopen(write_fd, "w", encoding="utf-8") as answers:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        pool = UploadPool(1, uploader_module=__name__)
+        try:
+            pool.start(timeout=15)
+            process = pool.submit(["prompt"])
+            assert process is not None
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.1)
+            answers.write("continue\n")
+            answers.flush()
+            assert process.wait(timeout=10) == 10
+            replacement = submit_when_ready(pool, ["prompt"])
+            with pytest.raises(subprocess.TimeoutExpired):
+                replacement.wait(timeout=0.1)
+            answers.write("continue\n")
+            answers.flush()
+            assert replacement.wait(timeout=10) == 10
+        finally:
+            pool.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Warm upload workers need forkserver")
