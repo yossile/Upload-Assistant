@@ -31,7 +31,7 @@ _upload_lock = threading.Lock()
 _upload_pool: UploadPool | None = None
 _active_upload_processes: dict[str, UploadHandle] = {}
 _submitted_upload_hashes: set[str] = set()
-_tagged_upload_hashes: set[str] = set()
+_watched_upload_hashes: set[str] = set()
 _completed_upload_hashes: dict[str, str] = {}
 _server_stopping = threading.Event()
 
@@ -47,21 +47,20 @@ def _collect_completed_uploads() -> None:
                 _completed_upload_hashes[torrent_hash] = "Uploaded" if returncode == 10 else "Cleanup"
 
 
-def _retag_completed_uploads(qbt_client: Client) -> None:
+def _update_completed_categories(qbt_client: Client) -> None:
     with _upload_lock:
         if _server_stopping.is_set():
             return
         _collect_completed_uploads()
-        for torrent_hash, tag in sorted(_completed_upload_hashes.items()):
+        for torrent_hash, category in sorted(_completed_upload_hashes.items()):
             try:
-                qbt_client.torrents_add_tags(torrent_hashes=torrent_hash, tags=tag)
-                qbt_client.torrents_remove_tags(torrent_hashes=torrent_hash, tags="Upload")
+                qbt_client.torrents_set_category(torrent_hashes=torrent_hash, category=category)
             except Exception:
-                app.logger.warning("Could not update tags for completed torrent %s; will retry", torrent_hash)
+                app.logger.warning("Could not update category for completed torrent %s; will retry", torrent_hash)
                 continue
             _completed_upload_hashes.pop(torrent_hash, None)
-            _tagged_upload_hashes.add(torrent_hash)
-            app.logger.info("Replaced Upload tag with %s for %s", tag, torrent_hash)
+            _watched_upload_hashes.add(torrent_hash)
+            app.logger.info("Replaced Upload category with %s for %s", category, torrent_hash)
 
 
 def _stop_upload_process(process: UploadHandle) -> None:
@@ -130,30 +129,32 @@ def _handle_shutdown(_signum: int, _frame: object) -> None:
     raise SystemExit(0)
 
 
-def _confirm_existing_tagged(torrents: dict[str, Any], policy: str) -> bool:
+def _confirm_existing_category(torrents: dict[str, Any], policy: str) -> bool:
     if policy != "ask":
         return policy == "start"
     if not sys.stdin.isatty():
-        app.logger.warning("Skipping existing Upload tags without a terminal; use --existing-tagged start to submit them")
+        app.logger.warning("Skipping existing torrents in category Upload without a terminal; use --existing-category start to submit them")
         return False
     listing = "\n".join(f"  {getattr(torrent, 'name', torrent_hash)} ({torrent_hash})" for torrent_hash, torrent in torrents.items())
     try:
-        answer = input(f"Found {len(torrents)} torrents already tagged Upload:\n{listing}\nStart these uploads? [y/N] ")
+        answer = input(f"Found {len(torrents)} torrents already in category Upload:\n{listing}\nStart these uploads? [y/N] ")
     except EOFError:
         return False
     return answer.strip().lower() in {"y", "yes"}
 
 
-def _poll_upload_tag(qbt_client: Client, *, existing_tagged: str | None = None) -> None:
-    _retag_completed_uploads(qbt_client)
+def _poll_upload_category(qbt_client: Client, *, existing_category: str | None = None) -> None:
+    _update_completed_categories(qbt_client)
+    matches = qbt_client.torrents_info(category="Upload")
     torrents = {
         torrent.hash.lower(): torrent
-        for torrent in qbt_client.torrents_info(tag="Upload")
+        for torrent in matches
         if isinstance(torrent.hash, str) and TORRENT_HASH_RE.fullmatch(torrent.hash)
+        and torrent.category == "Upload"
     }
-    skip_existing = bool(torrents) and existing_tagged is not None and not _confirm_existing_tagged(torrents, existing_tagged)
+    skip_existing = bool(torrents) and existing_category is not None and not _confirm_existing_category(torrents, existing_category)
     with _upload_lock:
-        for torrent_hash in sorted(_tagged_upload_hashes - torrents.keys()):
+        for torrent_hash in sorted(_watched_upload_hashes - torrents.keys()):
             process = _active_upload_processes.get(torrent_hash)
             try:
                 if process is not None:
@@ -161,11 +162,11 @@ def _poll_upload_tag(qbt_client: Client, *, existing_tagged: str | None = None) 
                         _stop_upload_process(process)
                     del _active_upload_processes[torrent_hash]
             except OSError:
-                app.logger.exception("Could not cancel untagged torrent %s; will retry", torrent_hash)
+                app.logger.exception("Could not cancel torrent %s removed from Upload selection; will retry", torrent_hash)
                 continue
             _submitted_upload_hashes.discard(torrent_hash)
-            _tagged_upload_hashes.discard(torrent_hash)
-        _tagged_upload_hashes.update(torrents)
+            _watched_upload_hashes.discard(torrent_hash)
+        _watched_upload_hashes.update(torrents)
         if skip_existing:
             _submitted_upload_hashes.update(torrents)
 
@@ -173,24 +174,24 @@ def _poll_upload_tag(qbt_client: Client, *, existing_tagged: str | None = None) 
         try:
             _, status = _toggle_upload_process(_upload_command(torrent_hash), torrent_hash, cancel_running=False)
         except OSError:
-            app.logger.exception("Could not start tagged torrent upload")
+            app.logger.exception("Could not start watched torrent upload")
             continue
         if status == "started":
-            app.logger.info("Started upload for tagged torrent %s", torrent_hash)
+            app.logger.info("Started upload for categorized torrent %s", torrent_hash)
 
 
-async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask", watch_tags: bool = True) -> None:
+async def _watch_upload_category(stop: threading.Event, poll_interval: int, existing_category: str = "ask", watch_categories: bool = True) -> None:
     from src.clients import Clients
 
     config = cast(dict[str, Any], import_module("data.config").config)
     client_name = config.get("DEFAULT", {}).get("default_torrent_client")
     client_config = config.get("TORRENT_CLIENTS", {}).get(client_name, {})
     if str(client_config.get("torrent_client", "")).lower() != "qbit":
-        app.logger.warning("Upload tag watcher disabled: default torrent client is not qBittorrent")
+        app.logger.warning("Upload category watcher disabled: default torrent client is not qBittorrent")
         return
 
-    if watch_tags:
-        print(f"Watching qBittorrent client '{client_name}' for tag 'Upload' (polling every {poll_interval}s).", flush=True)
+    if watch_categories:
+        print(f"Watching qBittorrent client '{client_name}' for category 'Upload' (polling every {poll_interval}s).", flush=True)
     clients = Clients(config)
     qbt_client = None
     startup_pending = True
@@ -199,21 +200,21 @@ async def _watch_upload_tag(stop: threading.Event, poll_interval: int, existing_
             if qbt_client is None:
                 qbt_client = await clients.init_qbittorrent_client(client_config)
             if qbt_client is not None and not stop.is_set():
-                if watch_tags:
-                    _poll_upload_tag(qbt_client, existing_tagged=existing_tagged if startup_pending else None)
+                if watch_categories:
+                    _poll_upload_category(qbt_client, existing_category=existing_category if startup_pending else None)
                     startup_pending = False
                 else:
-                    _retag_completed_uploads(qbt_client)
+                    _update_completed_categories(qbt_client)
         except Exception:
-            app.logger.warning("Could not poll qBittorrent Upload tag; will retry")
+            app.logger.warning("Could not poll qBittorrent Upload category; will retry")
         stop.wait(poll_interval)
 
 
-def _run_tag_watcher(stop: threading.Event, poll_interval: int, existing_tagged: str = "ask", watch_tags: bool = True) -> None:
+def _run_category_watcher(stop: threading.Event, poll_interval: int, existing_category: str = "ask", watch_categories: bool = True) -> None:
     try:
-        asyncio.run(_watch_upload_tag(stop, poll_interval, existing_tagged, watch_tags))
+        asyncio.run(_watch_upload_category(stop, poll_interval, existing_category, watch_categories))
     except Exception:
-        app.logger.warning("Upload tag watcher could not initialize")
+        app.logger.warning("Upload watcher could not initialize")
 
 
 @app.get("/upload")
@@ -265,15 +266,15 @@ def _start_upload_pool(workers: int) -> UploadPool | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global _upload_pool
-    parser = argparse.ArgumentParser(description="Upload qBittorrent torrents by hash over HTTP or by watching tags.")
+    parser = argparse.ArgumentParser(description="Upload qBittorrent torrents by hash over HTTP or by watching categories.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
-    parser.add_argument("--poll-interval", type=int, default=5, help="Seconds between Upload tag checks (default: 5)")
+    parser.add_argument("--poll-interval", type=int, default=5, help="Seconds between Upload category checks (default: 5)")
     parser.add_argument("--workers", type=int, default=5, help="Warm upload slots (default: 5; 0 uses a new Python interpreter per upload)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--no-tag-watch", action="store_true", help="Disable polling the default qBittorrent client for the Upload tag")
-    mode.add_argument("--watch-only", action="store_true", help="Watch Upload tags without starting the HTTP listener")
-    parser.add_argument("--existing-tagged", choices=("ask", "start", "skip"), default="ask", help="Handle existing Upload tags at startup (default: ask; skip without a terminal)")
+    mode.add_argument("--no-category-watch", action="store_true", help="Disable automatic submissions from the Upload category; completion updates remain enabled")
+    mode.add_argument("--watch-only", action="store_true", help="Watch the Upload category without starting the HTTP listener")
+    parser.add_argument("--existing-category", choices=("ask", "start", "skip"), default="ask", help="Handle existing Upload category torrents at startup (default: ask; skip without a terminal)")
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be greater than zero")
@@ -291,10 +292,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             app.logger.error("Could not start upload workers: %s", exc)
             return 1
         if args.watch_only:
-            _run_tag_watcher(stop, args.poll_interval, args.existing_tagged)
+            _run_category_watcher(stop, args.poll_interval, args.existing_category)
         else:
-            watcher_args = (stop, args.poll_interval, args.existing_tagged) if not args.no_tag_watch else (stop, args.poll_interval, args.existing_tagged, False)
-            watcher = threading.Thread(target=_run_tag_watcher, args=watcher_args, daemon=True)
+            watcher_args = (stop, args.poll_interval, args.existing_category) if not args.no_category_watch else (stop, args.poll_interval, args.existing_category, False)
+            watcher = threading.Thread(target=_run_category_watcher, args=watcher_args, daemon=True)
             watcher.start()
             app.run(host=args.host, port=args.port)
     except KeyboardInterrupt:
