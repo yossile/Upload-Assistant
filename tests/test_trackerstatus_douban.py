@@ -54,10 +54,13 @@ def test_douban_lookup_uses_imdb_id_from_attended_prompt(monkeypatch, tmdb_id, i
         no_imdb=False,
         imdb_id=imdb_id,
         tmdb_id=tmdb_id,
+        title="Example" if tmdb_id else "",
+        year=2026 if tmdb_id else None,
         imdb_tt="",
     )
 
     with pytest.raises(LookupReached):
         asyncio.run(trackerstatus.TrackerStatusManager({"TRACKERS": {}}).process_all_trackers(meta))
 
-    assert events == ["prompt", ("douban", "tt1234567")]  # noqa: S101
+    expected_events = [("douban", "")] if tmdb_id else ["prompt", ("douban", "tt1234567")]
+    assert events == expected_events  # noqa: S101

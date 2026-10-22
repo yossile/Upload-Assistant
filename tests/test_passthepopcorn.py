@@ -45,7 +45,8 @@ def submission_flow(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_group", [None, "419991"])
-async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(monkeypatch, submission_flow, initial_group):
+@pytest.mark.parametrize("imdb_id,no_imdb", [(12345, False), (0, False), (None, False), (12345, True)])
+async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(monkeypatch, submission_flow, initial_group, imdb_id, no_imdb):
     import src.trackerstatus as status_module
 
     submission_tracker, _client, make_meta, run = submission_flow
@@ -54,8 +55,11 @@ async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(m
     ] if initial_group else [])
     refreshed = PTPGroupLookup("419991", [])
     lookup = AsyncMock(side_effect=[initial, refreshed])
+    wrong_lookup = AsyncMock(side_effect=AssertionError("Unexpected group lookup route"))
+    use_imdb = bool(imdb_id) and not no_imdb
     monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, config: None)
-    monkeypatch.setattr(PassThePopcorn, "lookup_group", lookup)
+    monkeypatch.setattr(PassThePopcorn, "lookup_group", lookup if use_imdb else wrong_lookup)
+    monkeypatch.setattr(PassThePopcorn, "lookup_group_by_title", wrong_lookup if use_imdb else lookup)
     monkeypatch.setattr(PassThePopcorn, "get_additional_checks", AsyncMock(return_value=True))
     monkeypatch.setattr(PassThePopcorn, "get_name", AsyncMock(return_value=None))
     monkeypatch.setattr(PassThePopcorn, "start_poster_prefetch", Mock())
@@ -73,12 +77,17 @@ async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(m
     monkeypatch.setitem(status_module.tracker_class_map, "PASSTHEPOPCORN", PassThePopcorn)
     meta = make_meta()
     meta.category = "MOVIE"
+    meta.imdb_id = imdb_id
+    meta.no_imdb = no_imdb
+    meta.title = "Example"
+    meta.year = 2026
     config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
     submission_tracker.lookup_group_for_meta = PassThePopcorn(config).lookup_group_for_meta
     try:
         PassThePopcorn.start_group_prefetch(meta, config)
         await PassThePopcorn._group_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
         assert lookup.await_count == 1  # noqa: S101
+        wrong_lookup.assert_not_awaited()
 
         assert await status_module.TrackerStatusManager(config).process_all_trackers(meta) == 1  # noqa: S101
         assert lookup.await_count == 1  # noqa: S101
@@ -89,6 +98,7 @@ async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(m
         assert lookup.await_count == 2  # noqa: S101
         assert meta.ptp_groupid == refreshed.group_id  # noqa: S101
         submission_tracker.upload.assert_awaited_once()
+        wrong_lookup.assert_not_awaited()
     finally:
         await PassThePopcorn.cancel_prefetch(meta)
 
@@ -168,7 +178,8 @@ async def test_new_duplicate_found_under_lock_blocks_submission(monkeypatch, sub
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_uncertain_post_blocks_later_submission_and_releases_lock(submission_flow, cancelled):
+@pytest.mark.parametrize("imdb_id,no_imdb", [(12345, False), (0, False), (None, False), (12345, True)])
+async def test_uncertain_post_blocks_later_submission_and_releases_lock(submission_flow, cancelled, imdb_id, no_imdb):
     from src.resource_coordinator import exclusive_slot
 
     tracker, _client, make_meta, run = submission_flow
@@ -182,6 +193,10 @@ async def test_uncertain_post_blocks_later_submission_and_releases_lock(submissi
 
     tracker.upload.side_effect = upload
     meta = make_meta()
+    meta.imdb_id = imdb_id
+    meta.no_imdb = no_imdb
+    meta.title = "Example"
+    meta.year = 2026
     task = asyncio.create_task(run(meta))
     await asyncio.wait_for(posting.wait(), timeout=2)
     if cancelled:
@@ -190,12 +205,45 @@ async def test_uncertain_post_blocks_later_submission_and_releases_lock(submissi
             await task
     else:
         await task
-    assert (Path(meta.base_dir) / "tmp" / "locks" / "ptp-pending-12345.json").exists()  # noqa: S101
+    markers = list((Path(meta.base_dir) / "tmp" / "locks").glob("ptp-pending-*.json"))
+    assert len(markers) == 1  # noqa: S101
+    if imdb_id and not no_imdb:
+        assert markers[0].name == "ptp-pending-12345.json"  # noqa: S101
+    else:
+        assert markers[0].name.startswith("ptp-pending-title-")  # noqa: S101
     async with exclusive_slot("ptp-submission", Path(meta.base_dir) / "tmp" / "locks"):
         pass
-    await run(make_meta("1080p"))
+    retry = meta.copy()
+    retry.resolution = "1080p"
+    retry.tracker_status = {"PASSTHEPOPCORN": {"upload": True}}
+    await run(retry)
     assert tracker.upload.await_count == 1  # noqa: S101
     assert tracker.lookup_group_for_meta.await_count == 2  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("imdb_id,no_imdb", [(0, False), (None, False), (12345, True)])
+@pytest.mark.parametrize("other_title,other_year", [("Different", 2026), ("Example", 2025)])
+async def test_uncertain_imdb_free_post_does_not_block_other_movies(submission_flow, imdb_id, no_imdb, other_title, other_year):
+    tracker, _client, make_meta, run = submission_flow
+    tracker.upload.side_effect = [httpx.ReadTimeout("outcome unknown"), True]
+    first = make_meta()
+    first.imdb_id = imdb_id
+    first.no_imdb = no_imdb
+    first.title = "Example"
+    first.year = 2026
+    await run(first)
+    assert tracker.upload.await_count == 1  # noqa: S101
+
+    second = make_meta("1080p")
+    second.imdb_id = imdb_id
+    second.no_imdb = no_imdb
+    second.title = other_title
+    second.year = other_year
+    await run(second)
+    assert tracker.upload.await_count == 2  # noqa: S101
+    assert second.tracker_status["PASSTHEPOPCORN"]["upload_success"] is True  # noqa: S101
+    assert len(list((Path(first.base_dir) / "tmp" / "locks").glob("ptp-pending-*.json"))) == 1  # noqa: S101
 
 
 @pytest.mark.asyncio
@@ -298,16 +346,57 @@ async def test_group_lookup_never_treats_unverified_results_as_absent(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_group_lookup_accepts_only_confirmed_zero_results(monkeypatch):
+@pytest.mark.parametrize("movie_fields", [{}, {"Movies": None}, {"Movies": []}])
+async def test_group_lookup_accepts_only_confirmed_zero_results(monkeypatch, movie_fields):
     client = _Client()
-    client.get = AsyncMock(return_value=httpx.Response(200, json={"Page": "Browse", "TotalResults": "0", "Movies": []}, request=httpx.Request("GET", "https://example.test")))
+    payload = {"Page": "Browse", "TotalResults": "0", **movie_fields}
+    client.get = AsyncMock(return_value=httpx.Response(200, json=payload, request=httpx.Request("GET", "https://example.test")))
     monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
     tracker = object.__new__(PassThePopcorn)
     tracker.api_user, tracker.api_key, tracker.user_agent = "user", "key", "agent"
     assert (await tracker.lookup_group(9876)).group_id is None  # noqa: S101
     assert tracker._group_lookup_succeeded  # noqa: S101
+    assert (await tracker.lookup_group_for_meta(Meta(title="Example", year=2026, tmdb_id=123))).group_id is None  # noqa: S101
+    assert client.get.await_args.kwargs["params"] == {  # noqa: S101
+        "action": "advanced", "searchstr": "Example", "json": "noredirect", "jsontrumpable": "1",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("details", [False, True])
+@pytest.mark.parametrize("no_imdb", [False, True])
+async def test_imdb_free_group_lookup_matches_title_and_year(monkeypatch, details, no_imdb):
+    torrents = [{"Quality": "High Definition", "Resolution": "720p", "ReleaseName": "Example.720p"}]
+    movie = {"Title": "Example", "Year": "2026", "ImdbId": "0", "GroupId": "1234", "Torrents": torrents}
+    payload = {"Page": "Details", **movie} if details else {"Page": "Browse", "TotalResults": "1", "Movies": [movie]}
+    client = _Client()
+    client.get = AsyncMock(return_value=httpx.Response(200, json=payload, request=httpx.Request("GET", "https://example.test")))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    tracker = object.__new__(PassThePopcorn)
+    tracker.api_user, tracker.api_key, tracker.user_agent = "user", "key", "agent"
+
+    result = await tracker.lookup_group_for_meta(Meta(title="Example", year=2026, no_imdb=no_imdb))
+    assert result == PTPGroupLookup("1234", torrents)  # noqa: S101
+    assert tracker._group_lookup_succeeded  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("movies", [
+    [{"Title": "Example", "Year": "2026", "GroupId": "1234"}],
+    [{"GroupId": "1234", "Torrents": []}],
+    [{"Title": "Example", "Year": "2026", "GroupId": "1234", "Torrents": []}] * 2,
+])
+async def test_title_lookup_rejects_unverified_groups(monkeypatch, movies):
+    client = _Client()
+    payload = {"Page": "Browse", "TotalResults": str(len(movies)), "Movies": movies}
+    client.get = AsyncMock(return_value=httpx.Response(200, json=payload, request=httpx.Request("GET", "https://example.test")))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    tracker = object.__new__(PassThePopcorn)
+    tracker.api_user, tracker.api_key, tracker.user_agent = "user", "key", "agent"
+
     with pytest.raises(PTPGroupLookupError):
-        await tracker.lookup_group_for_meta(Meta(tmdb_id=123))
+        await tracker.lookup_group_for_meta(Meta(title="Example", year=2026))
+    assert not tracker._group_lookup_succeeded  # noqa: S101
 
 
 def test_get_type_supports_tmdb_only_metadata() -> None:

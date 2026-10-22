@@ -1,5 +1,6 @@
 # Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -346,7 +347,13 @@ async def process_trackers(
                         lookup = await ptp.lookup_group_for_meta(meta)
                         log_ptp_timing(meta, "final group and duplicate lookup", lookup_started_at)
                         meta.ptp_groupid = lookup.group_id
-                        pending_path = Path(meta.base_dir) / "tmp" / "locks" / f"ptp-pending-{int(str(meta.imdb_id).removeprefix('tt'))}.json"
+                        pending_id = str(meta.imdb_id or "").removeprefix("tt")
+                        if meta.no_imdb or not pending_id.isdigit() or int(pending_id) == 0:
+                            title_identity = json.dumps([meta.title.strip(), str(meta.year or "")])
+                            pending_id = f"title-{hashlib.sha256(title_identity.encode('utf-8')).hexdigest()}"
+                        else:
+                            pending_id = str(int(pending_id))
+                        pending_path = Path(meta.base_dir) / "tmp" / "locks" / f"ptp-pending-{pending_id}.json"
                         if pending_path.exists():
                             raise RuntimeError(f"Previous PTP submission outcome is unknown. Verify it on PTP before removing {pending_path} and retrying.")
                         candidates = ptp.duplicate_candidates(lookup, meta)

@@ -84,7 +84,7 @@ class TrackerStatusManager:
                 while True:
                     try:
                         imdb_id = await prompt_in_thread(
-                            cli_ui.ask_string, "Unable to find IMDB id, please enter e.g.(tt1234567) or press Enter to skip uploading to trackers requiring it:"
+                            cli_ui.ask_string, "Unable to identify the PTP movie by IMDb or title and year. Enter an IMDb ID e.g.(tt1234567) or press Enter to skip PTP:"
                         )
                     except EOFError:
                         logger.info("\n[red]Exiting on user request (Ctrl+C)[/red]")
@@ -145,7 +145,7 @@ class TrackerStatusManager:
                 tracker_class = tracker_class_map[tracker_name](config=self.config)
                 if tracker_name == "PASSTHEPOPCORN" and PassThePopcorn._group_identity(local_meta) is None:
                     local_tracker_status["skipped"] = True
-                    logger.info("PASSTHEPOPCORN: Skipping upload because reliable group discovery requires an IMDb ID.")
+                    logger.info("PASSTHEPOPCORN: Skipping upload because group discovery requires IMDb or a movie title and year.")
 
                 if not local_tracker_status["skipped"]:
                     result = await tracker_setup.check_banned_group(tracker_class.tracker, tracker_class.banned_groups, local_meta)

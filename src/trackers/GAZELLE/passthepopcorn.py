@@ -171,6 +171,9 @@ class PassThePopcorn:
             imdb_id = str(meta.imdb_id).removeprefix("tt")
             if imdb_id.isdigit() and int(imdb_id) > 0:
                 return "imdb", imdb_id.zfill(7)
+        year = str(meta.year or "")
+        if meta.title and meta.title.strip() and year.isdigit() and int(year) > 0:
+            return "title", json.dumps([meta.title.strip(), year])
         return None
 
     @classmethod
@@ -195,12 +198,13 @@ class PassThePopcorn:
         key = cls._prefetch_key(meta)
         if key in cls._group_prefetch_tasks:
             return
+        snapshot = meta.copy()
 
         async def lookup() -> PTPGroupLookup | None:
             try:
                 tracker = cls(config)
                 started_at = time.perf_counter()
-                result = await tracker.lookup_group(identity[1])
+                result = await tracker.lookup_group_for_meta(snapshot)
                 log_ptp_timing(meta, "early group lookup", started_at)
                 if result.group_id is None:
                     cls.start_poster_prefetch(meta, config)
@@ -594,21 +598,32 @@ class PassThePopcorn:
     async def lookup_group_for_meta(self, meta: Meta) -> PTPGroupLookup:
         identity = self._group_identity(meta)
         if identity is None:
-            raise PTPGroupLookupError("PTP group discovery requires a valid IMDb ID.")
+            raise PTPGroupLookupError("PTP group discovery requires an IMDb ID or a movie title and year.")
+        if identity[0] == "title":
+            return await self.lookup_group_by_title(meta)
         return await self.lookup_group(identity[1])
 
     async def lookup_group(self, imdb: int | str) -> PTPGroupLookup:
+        return await self._lookup_group("imdb", str(imdb).removeprefix("tt"))
+
+    async def lookup_group_by_title(self, meta: Meta) -> PTPGroupLookup:
+        identity = self._group_identity(meta)
+        if identity is None or identity[0] != "title":
+            raise PTPGroupLookupError("PTP title search requires a movie title and year.")
+        return await self._lookup_group(*identity)
+
+    async def _lookup_group(self, identifier_type: str, identifier: str) -> PTPGroupLookup:
         self._group_lookup_succeeded = False
-        imdb_id = str(imdb).removeprefix("tt")
-        if not imdb_id.isdigit() or int(imdb_id) <= 0:
-            raise PTPGroupLookupError("PTP group discovery requires a valid IMDb ID.")
-        imdb_id = imdb_id.zfill(7)
-        params = {
-            "action": "advanced",
-            "searchstr": f"https://www.imdb.com/title/tt{imdb_id}/",
-            "json": "noredirect",
-            "jsontrumpable": "1",
-        }
+        title, year = "", ""
+        if identifier_type == "title":
+            title, year = cast(tuple[str, str], json.loads(identifier))
+            search = title
+        else:
+            if not identifier.isdigit() or int(identifier) <= 0:
+                raise PTPGroupLookupError("PTP group discovery requires a valid IMDb ID.")
+            identifier = identifier.zfill(7)
+            search = f"https://www.imdb.com/title/tt{identifier}/"
+        params = {"action": "advanced", "searchstr": search, "json": "noredirect", "jsontrumpable": "1"}
         headers: dict[str, str] = {"ApiUser": self.api_user, "ApiKey": self.api_key, "User-Agent": self.user_agent}
         url = f"{self.base_url}/torrents.php"
         try:
@@ -618,7 +633,10 @@ class PassThePopcorn:
             raw_data: Any = response.json()
             if not isinstance(raw_data, dict):
                 raise PTPGroupLookupError("PTP returned an unexpected group search response.")
-            data = cast(dict[str, Any], raw_data)
+            response_data = cast(dict[str, Any], raw_data)
+            data: dict[str, Any] = response_data
+            if identifier_type == "title" and response_data.get("Page") == "Details":
+                data = {"Page": "Browse", "TotalResults": "1", "Movies": [response_data]}
             if data.get("Page") != "Browse":
                 raise PTPGroupLookupError("PTP returned an unexpected group search response.")
             total = data.get("TotalResults")
@@ -626,19 +644,38 @@ class PassThePopcorn:
                 raise PTPGroupLookupError("PTP group search did not return a valid result count.")
             result_count = int(str(total))
             raw_movies = data.get("Movies")
+            if result_count == 0 and (raw_movies is None or raw_movies == []):
+                self._group_lookup_succeeded = True
+                return PTPGroupLookup(None, [])
             if not isinstance(raw_movies, list):
                 raise PTPGroupLookupError("PTP group search returned incomplete results.")
             movies = cast(list[Any], raw_movies)
             if len(movies) != result_count:
-                raise PTPGroupLookupError("PTP group search returned incomplete results.")
+                raise PTPGroupLookupError(f"PTP group search returned incomplete results (TotalResults={result_count}, Movies={len(movies)}).")
             if result_count == 0:
                 self._group_lookup_succeeded = True
                 return PTPGroupLookup(None, [])
             if any(not isinstance(movie, dict) for movie in movies):
                 raise PTPGroupLookupError("PTP group search returned malformed movies.")
-            matches = [movie for movie in cast(list[dict[str, Any]], movies) if str(movie.get("ImdbId", "")).removeprefix("tt").zfill(7) == imdb_id]
+            if identifier_type == "title":
+                if any(not movie.get("Title", movie.get("Name")) or not str(movie.get("Year", "")).isdigit() for movie in movies):
+                    raise PTPGroupLookupError("PTP title search returned incomplete title or year data.")
+                normalized_title = re.sub(r"\W+", "", title).casefold()
+                matches = [
+                    movie for movie in cast(list[dict[str, Any]], movies)
+                    if re.sub(r"\W+", "", str(movie.get("Title", movie.get("Name", "")))).casefold() == normalized_title
+                    and str(movie.get("Year")) == year
+                ]
+                if not matches:
+                    self._group_lookup_succeeded = True
+                    return PTPGroupLookup(None, [])
+            else:
+                matches = [
+                    movie for movie in cast(list[dict[str, Any]], movies)
+                    if str(movie.get("ImdbId", "")).removeprefix("tt").zfill(7) == identifier
+                ]
             if len(matches) != 1:
-                raise PTPGroupLookupError("PTP group search did not identify one exact IMDb match.")
+                raise PTPGroupLookupError(f"PTP group search did not identify one exact {identifier_type} match.")
             movie = matches[0]
             group_id = str(movie.get("GroupId", ""))
             raw_torrents = movie.get("Torrents")
