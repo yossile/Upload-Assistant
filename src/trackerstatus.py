@@ -78,8 +78,8 @@ class TrackerStatusManager:
                 status_map[tracker] = {}
 
         # Prompt for IMDB ID once if a tracker needs it and it's missing in attended mode
-        if not meta.get("unattended", False) and not meta.get("no_imdb", False) and meta.get("imdb_id", 0) == 0:
-            needs_imdb = "PASSTHEPOPCORN" in meta.trackers and not meta.get("tmdb_id")
+        if not meta.get("unattended", False) and not meta.get("no_imdb", False) and PassThePopcorn._group_identity(meta) is None:
+            needs_imdb = "PASSTHEPOPCORN" in meta.trackers
             if needs_imdb:
                 while True:
                     try:
@@ -143,8 +143,9 @@ class TrackerStatusManager:
 
             if tracker_name in tracker_class_map:
                 tracker_class = tracker_class_map[tracker_name](config=self.config)
-                if tracker_name == "PASSTHEPOPCORN" and local_meta.get("imdb_id", 0) == 0 and not local_meta.get("tmdb_id"):
+                if tracker_name == "PASSTHEPOPCORN" and PassThePopcorn._group_identity(local_meta) is None:
                     local_tracker_status["skipped"] = True
+                    logger.info("PASSTHEPOPCORN: Skipping upload because reliable group discovery requires an IMDb ID.")
 
                 if not local_tracker_status["skipped"]:
                     result = await tracker_setup.check_banned_group(tracker_class.tracker, tracker_class.banned_groups, local_meta)
@@ -249,13 +250,11 @@ class TrackerStatusManager:
                             search_started = time.monotonic()
                             try:
                                 group_lookup_started_at = time.perf_counter()
-                                group_id = await ptp.get_group_for_meta(local_meta)
-                                log_ptp_timing(local_meta, "group lookup", group_lookup_started_at)
+                                lookup = await ptp.get_initial_group_lookup(local_meta)
+                                log_ptp_timing(local_meta, "group and duplicate lookup", group_lookup_started_at)
                                 async with meta_lock:
-                                    meta.ptp_groupid = group_id
-                                dupe_search_started_at = time.perf_counter()
-                                dupes = cast(list[Any], await ptp.search_existing(group_id or "", cast(dict[str, Any], local_meta)))
-                                log_ptp_timing(local_meta, "duplicate search", dupe_search_started_at)
+                                    meta.ptp_groupid = lookup.group_id
+                                dupes = ptp.duplicate_candidates(lookup, local_meta)
                                 await record_event_async(
                                     "api", service=tracker_name, operation="search", outcome="success", duration_ms=(time.monotonic() - search_started) * 1000
                                 )

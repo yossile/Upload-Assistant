@@ -1,9 +1,11 @@
 # Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import asyncio
+import json
 import sys
 import time
 import traceback
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 import cli_ui
@@ -21,6 +23,7 @@ from src.meta import Meta
 from src.ptp_timing import log_ptp_timing
 from src.qbitwait import Wait
 from src.rehostimages import check_tracker_image_hosts, has_restricted_image_hosts, select_common_image_host
+from src.resource_coordinator import exclusive_slot
 from src.slot_rules.models import Verdict
 from src.slot_rules.registry import evaluate_slots
 from src.stats import record_event_async
@@ -335,26 +338,60 @@ async def process_trackers(
             if upload_status:
                 try:
                     ptp = PassThePopcorn(config=config)
-                    group_id = meta.ptp_groupid
                     image_hosts_started_at = time.perf_counter()
                     await check_tracker_image_hosts(meta, ptp)
                     log_ptp_timing(meta, "image host checks", image_hosts_started_at)
-                    form_started_at = time.perf_counter()
-                    ptp_url, ptp_data = await ptp.fill_upload_form(group_id, meta)
-                    log_ptp_timing(meta, "upload form preparation", form_started_at)
-                    is_uploaded = False
-                    try:
-                        upload_start_time = time.perf_counter()
+                    async with exclusive_slot("ptp-submission", Path(meta.base_dir) / "tmp" / "locks"):
+                        lookup_started_at = time.perf_counter()
+                        lookup = await ptp.lookup_group_for_meta(meta)
+                        log_ptp_timing(meta, "final group and duplicate lookup", lookup_started_at)
+                        meta.ptp_groupid = lookup.group_id
+                        pending_path = Path(meta.base_dir) / "tmp" / "locks" / f"ptp-pending-{int(str(meta.imdb_id).removeprefix('tt'))}.json"
+                        if pending_path.exists():
+                            raise RuntimeError(f"Previous PTP submission outcome is unknown. Verify it on PTP before removing {pending_path} and retrying.")
+                        candidates = ptp.duplicate_candidates(lookup, meta)
+                        initial = meta.initial_dupes.get(tracker, [])
+                        new_candidates = [candidate for candidate in candidates if candidate not in initial]
+                        if new_candidates:
+                            decision = await evaluate_slots(candidates, meta, tracker, config)
+                            blocked = decision is not None and decision.verdict is Verdict.BLOCK
+                            if decision is None or decision.verdict is not Verdict.ALLOW:
+                                blocked = blocked or bool(await DupeChecker(config).filter_dupes(new_candidates, meta, tracker))
+                            if blocked:
+                                status = meta.tracker_status.setdefault(tracker, {})
+                                status["upload"] = False
+                                status["dupe"] = True
+                                status["status_message"] = "Skipped: conflicting release appeared before PTP submission"
+                                logger.info(f"{tracker}: [yellow]{status['status_message']}[/yellow]")
+                                return
+                        form_started_at = time.perf_counter()
+                        ptp_url, ptp_data = await ptp.fill_upload_form(lookup.group_id, meta)
+                        log_ptp_timing(meta, "upload form preparation", form_started_at)
+                        is_uploaded = False
                         try:
-                            is_uploaded = await ptp.upload(meta, ptp_url, ptp_data)
-                        finally:
-                            upload_duration = time.perf_counter() - upload_start_time
-                            meta[f"{tracker}_upload_duration"] = upload_duration
-                            log_ptp_timing(meta, "upload submission and response validation", upload_start_time)
-                    except Exception as e:
-                        logger.info(f"[red]Upload failed: {escape(str(e))}[/red]")
-                        logger.info(traceback.format_exc(), extra={"markup": False})
-                        return
+                            upload_start_time = time.perf_counter()
+                            if not meta.debug:
+                                with pending_path.open("x", encoding="utf-8") as pending_file:
+                                    json.dump({"release": meta.name, "uuid": meta.uuid}, pending_file)
+                            try:
+                                is_uploaded = await ptp.upload(meta, ptp_url, ptp_data)
+                                submission_status = meta.tracker_status.setdefault(tracker, {})
+                                if is_uploaded or submission_status.get("submission_rejected"):
+                                    pending_path.unlink(missing_ok=True)
+                                elif not meta.debug:
+                                    submission_status["submission_outcome_unknown"] = True
+                                    logger.warning(f"{tracker}: Submission outcome unknown; verify on PTP before removing {pending_path} and retrying.")
+                            finally:
+                                upload_duration = time.perf_counter() - upload_start_time
+                                meta[f"{tracker}_upload_duration"] = upload_duration
+                                log_ptp_timing(meta, "upload submission and response validation", upload_start_time)
+                        except Exception as e:
+                            status = meta.tracker_status.setdefault(tracker, {})
+                            status["submission_outcome_unknown"] = pending_path.exists()
+                            status["status_message"] = f"Upload failed: {e}. Verify PTP before retrying if {pending_path} exists."
+                            logger.info(f"[red]Upload failed: {escape(str(e))}[/red]")
+                            logger.info(traceback.format_exc(), extra={"markup": False})
+                            return
                     status = meta.tracker_status.setdefault(ptp.tracker, {})
                     if is_uploaded and "data error" not in str(status.get("status_message", "")):
                         status["upload_success"] = True
@@ -373,7 +410,10 @@ async def process_trackers(
                         status["upload_success"] = False
                         print_tracker_result(tracker, ptp, status, False)
                         logger.info(f"[red]{tracker} upload failed or returned data error.[/red]")
-                except Exception:
+                except Exception as error:
+                    status = meta.tracker_status.setdefault(tracker, {})
+                    status["upload"] = False
+                    status["status_message"] = f"Skipped: {error}"
                     logger.info(traceback.format_exc(), extra={"markup": False})
                     return
 

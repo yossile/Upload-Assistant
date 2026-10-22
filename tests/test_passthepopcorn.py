@@ -1,4 +1,6 @@
 import asyncio
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -8,27 +10,243 @@ import pytest
 from src.artwork import select_ptp_cover_url
 from src.meta import Meta
 from src.tracker_images import set_tracker_image_collection
-from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn
+from src.trackers.GAZELLE.passthepopcorn import PassThePopcorn, PTPGroupLookup, PTPGroupLookupError
 
 
-class _Response:
-    status_code = 200
-    headers = {"content-type": "application/json"}
-    text = ""
+@pytest.fixture
+def submission_flow(monkeypatch, tmp_path):
+    import src.trackerhandle as handler
 
-    def json(self):
-        return {"Page": "Details", "GroupId": 1234, "Name": "Example", "Year": 2024}
+    tracker = SimpleNamespace(
+        tracker="PASSTHEPOPCORN", lookup_group_for_meta=AsyncMock(return_value=PTPGroupLookup(None, [])),
+        duplicate_candidates=PassThePopcorn.duplicate_candidates, fill_upload_form=AsyncMock(return_value=("url", {})),
+        upload=AsyncMock(return_value=True), prepare_for_seeding=AsyncMock(),
+    )
+    client = SimpleNamespace(add_to_client=AsyncMock())
+    monkeypatch.setattr(handler, "PassThePopcorn", lambda **_kwargs: tracker)
+    monkeypatch.setattr(handler, "TrackerSetup", lambda **_kwargs: SimpleNamespace(trackers_enabled=lambda _meta: ["PASSTHEPOPCORN"]))
+    monkeypatch.setattr(handler, "provision_tracker_torrents", AsyncMock())
+    monkeypatch.setattr(handler, "check_tracker_image_hosts", AsyncMock())
+    monkeypatch.setattr(handler, "record_event_async", AsyncMock())
+    monkeypatch.setattr(handler, "evaluate_slots", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler, "DupeChecker", lambda _config: SimpleNamespace(filter_dupes=AsyncMock(return_value=[])))
+
+    def make_meta(resolution="720p"):
+        return Meta(
+            base_dir=str(tmp_path), imdb_id=12345, name=f"Example.{resolution}", uuid=resolution, resolution=resolution,
+            unattended=True, trackers=["PASSTHEPOPCORN"], tracker_status={"PASSTHEPOPCORN": {"upload": True}},
+        )
+
+    async def run(meta):
+        await handler.process_trackers(meta, {"DEFAULT": {"smart_image_host_selection": False}}, client, [], {}, [], [])
+
+    return tracker, client, make_meta, run
 
 
-class _SearchResponse(_Response):
-    def json(self):
-        return {
-            "TotalResults": 20,
-            "Movies": [
-                {"TmdbId": 1126341, "GroupId": 1234, "Title": "Example", "Year": 2024},
-                {"TmdbId": 9999999, "GroupId": 5678, "Title": "Unrelated", "Year": 2023},
-            ],
-        }
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_group", [None, "419991"])
+async def test_early_lookup_is_reused_for_eligibility_but_submission_refreshes(monkeypatch, submission_flow, initial_group):
+    import src.trackerstatus as status_module
+
+    submission_tracker, _client, make_meta, run = submission_flow
+    initial = PTPGroupLookup(initial_group, [
+        {"Quality": "High Definition", "Resolution": "1080p", "ReleaseName": "Example.1080p"},
+    ] if initial_group else [])
+    refreshed = PTPGroupLookup("419991", [])
+    lookup = AsyncMock(side_effect=[initial, refreshed])
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, config: None)
+    monkeypatch.setattr(PassThePopcorn, "lookup_group", lookup)
+    monkeypatch.setattr(PassThePopcorn, "get_additional_checks", AsyncMock(return_value=True))
+    monkeypatch.setattr(PassThePopcorn, "get_name", AsyncMock(return_value=None))
+    monkeypatch.setattr(PassThePopcorn, "start_poster_prefetch", Mock())
+    monkeypatch.setattr(status_module, "TrackerSetup", lambda **_kwargs: SimpleNamespace(
+        filter_unsupported_trackers=lambda meta: meta,
+        check_banned_group=AsyncMock(return_value=False), get_torrent_claims=AsyncMock(return_value=False),
+    ))
+    monkeypatch.setattr(status_module, "AvistaZNetworkRouter", lambda *_args: SimpleNamespace(apply=AsyncMock()))
+    monkeypatch.setattr(status_module, "UploadHelper", lambda _config: SimpleNamespace(
+        dupe_check=AsyncMock(side_effect=lambda _dupes, meta, *_args: (False, meta)),
+    ))
+    monkeypatch.setattr(status_module, "DupeChecker", lambda _config: SimpleNamespace(filter_dupes=AsyncMock(return_value=[])))
+    monkeypatch.setattr(status_module, "evaluate_slots", AsyncMock(return_value=None))
+    monkeypatch.setattr(status_module, "record_event_async", AsyncMock())
+    monkeypatch.setitem(status_module.tracker_class_map, "PASSTHEPOPCORN", PassThePopcorn)
+    meta = make_meta()
+    meta.category = "MOVIE"
+    config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
+    submission_tracker.lookup_group_for_meta = PassThePopcorn(config).lookup_group_for_meta
+    try:
+        PassThePopcorn.start_group_prefetch(meta, config)
+        await PassThePopcorn._group_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
+        assert lookup.await_count == 1  # noqa: S101
+
+        assert await status_module.TrackerStatusManager(config).process_all_trackers(meta) == 1  # noqa: S101
+        assert lookup.await_count == 1  # noqa: S101
+        assert meta.ptp_groupid == initial_group  # noqa: S101
+        assert meta.initial_dupes["PASSTHEPOPCORN"] == PassThePopcorn.duplicate_candidates(initial, meta)  # noqa: S101
+
+        await run(meta)
+        assert lookup.await_count == 2  # noqa: S101
+        assert meta.ptp_groupid == refreshed.group_id  # noqa: S101
+        submission_tracker.upload.assert_awaited_once()
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_submissions_recheck_group_after_first_post_and_unlock_before_seeding(submission_flow):
+    from src.resource_coordinator import exclusive_slot
+
+    tracker, client, make_meta, run = submission_flow
+    posting = asyncio.Event()
+    release_post = asyncio.Event()
+    group_id = None
+    events = []
+
+    async def lookup(meta):
+        events.append(("lookup", meta.resolution, group_id))
+        return PTPGroupLookup(group_id, [])
+
+    async def upload(meta, _url, _data):
+        nonlocal group_id
+        events.append(("post", meta.resolution))
+        if group_id is None:
+            posting.set()
+            await release_post.wait()
+            group_id = "419991"
+        return True
+
+    async def seed(meta):
+        async def acquire():
+            async with exclusive_slot("ptp-submission", Path(meta.base_dir) / "tmp" / "locks"):
+                events.append(("seed", meta.resolution))
+        await asyncio.wait_for(acquire(), timeout=2)
+
+    tracker.lookup_group_for_meta.side_effect = lookup
+    tracker.upload.side_effect = upload
+    tracker.prepare_for_seeding.side_effect = seed
+    first, second = make_meta(), make_meta("1080p")
+    first_task = asyncio.create_task(run(first))
+    await asyncio.wait_for(posting.wait(), timeout=2)
+    second_task = asyncio.create_task(run(second))
+    await asyncio.sleep(0)
+    assert tracker.lookup_group_for_meta.await_count == 1  # noqa: S101
+    release_post.set()
+    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=5)
+
+    assert [call.args[0] for call in tracker.fill_upload_form.await_args_list] == [None, "419991"]  # noqa: S101
+    assert events.index(("post", "720p")) < events.index(("lookup", "1080p", "419991"))  # noqa: S101
+    assert client.add_to_client.await_count == 2  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_final_lookup_failure_never_builds_or_submits_form(submission_flow):
+    tracker, _client, make_meta, run = submission_flow
+    tracker.lookup_group_for_meta.side_effect = PTPGroupLookupError("lookup failed")
+    meta = make_meta()
+    await run(meta)
+    tracker.fill_upload_form.assert_not_awaited()
+    tracker.upload.assert_not_awaited()
+    assert meta.tracker_status["PASSTHEPOPCORN"]["upload"] is False  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_new_duplicate_found_under_lock_blocks_submission(monkeypatch, submission_flow):
+    import src.trackerhandle as handler
+
+    tracker, _client, make_meta, run = submission_flow
+    tracker.lookup_group_for_meta.return_value = PTPGroupLookup("419991", [
+        {"Quality": "High Definition", "Resolution": "720p", "ReleaseName": "Example.720p"},
+    ])
+    monkeypatch.setattr(handler, "DupeChecker", lambda _config: SimpleNamespace(filter_dupes=AsyncMock(return_value=["Example.720p"])))
+    meta = make_meta()
+    await run(meta)
+    tracker.upload.assert_not_awaited()
+    assert meta.ptp_groupid == "419991"  # noqa: S101
+    assert meta.tracker_status["PASSTHEPOPCORN"]["dupe"] is True  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_uncertain_post_blocks_later_submission_and_releases_lock(submission_flow, cancelled):
+    from src.resource_coordinator import exclusive_slot
+
+    tracker, _client, make_meta, run = submission_flow
+    posting = asyncio.Event()
+
+    async def upload(*_args):
+        posting.set()
+        if cancelled:
+            await asyncio.Event().wait()
+        raise httpx.ReadTimeout("outcome unknown")
+
+    tracker.upload.side_effect = upload
+    meta = make_meta()
+    task = asyncio.create_task(run(meta))
+    await asyncio.wait_for(posting.wait(), timeout=2)
+    if cancelled:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    assert (Path(meta.base_dir) / "tmp" / "locks" / "ptp-pending-12345.json").exists()  # noqa: S101
+    async with exclusive_slot("ptp-submission", Path(meta.base_dir) / "tmp" / "locks"):
+        pass
+    await run(make_meta("1080p"))
+    assert tracker.upload.await_count == 1  # noqa: S101
+    assert tracker.lookup_group_for_meta.await_count == 2  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_changed_cover_cancels_blocked_obsolete_poster_without_waiting():
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {"DEFAULT": {"img_host_1": "imgbb"}}
+    tracker.rehost_poster_to_selected_host = AsyncMock(return_value="https://host.example/new.jpg")
+    snapshot = Meta(base_dir="test-stale-cover", uuid="release", imdb_id=12345, artwork_url="https://images.example/old.jpg")
+    current = snapshot.copy()
+    current.artwork_url = "https://images.example/new.jpg"
+    old_task = asyncio.create_task(asyncio.Event().wait())
+    tracker._poster_prefetch_tasks[tracker._prefetch_key(current)] = (snapshot, time.monotonic(), old_task)
+    try:
+        result = await asyncio.wait_for(tracker.get_poster_for_meta(current, current.artwork_url), timeout=1)
+        assert result == "https://host.example/new.jpg"  # noqa: S101
+        assert old_task.cancelled()  # noqa: S101
+    finally:
+        old_task.cancel()
+        await asyncio.gather(old_task, return_exceptions=True)
+        await tracker.cancel_prefetch(current)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_empty_uuid_posters_use_distinct_files(monkeypatch, tmp_path):
+    all_hosting = asyncio.Event()
+    paths = []
+
+    async def get(image_url):
+        return httpx.Response(200, content=image_url.encode(), request=httpx.Request("GET", image_url))
+
+    async def host(_meta, _count, _total, _offset, _limit, files, _images):
+        path = Path(files[0])
+        paths.append(path)
+        if len(paths) == 2:
+            all_hosting.set()
+        await all_hosting.wait()
+        return [{"raw_url": path.read_bytes().decode()}], 1
+
+    client = _Client()
+    client.get = get
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {"DEFAULT": {"img_host_1": "imgbb"}}
+    tracker.uploadscreens_manager = SimpleNamespace(upload_screens=host)
+    covers = ["https://images.example/first.jpg", "https://images.example/second.jpg"]
+    metas = [Meta(base_dir=str(tmp_path), uuid="", source_torrent_hash=f"hash-{index}") for index in range(2)]
+    results = await asyncio.wait_for(asyncio.gather(*(
+        tracker.rehost_poster_to_selected_host(meta, cover) for meta, cover in zip(metas, covers, strict=True)
+    )), timeout=2)
+    assert paths[0] != paths[1]  # noqa: S101
+    assert results == covers  # noqa: S101
 
 
 class _Client:
@@ -38,34 +256,58 @@ class _Client:
     async def __aexit__(self, *_args):
         return None
 
-    async def get(self, *, url, headers, params):
-        assert params == {"tmdb": 9876, "json": "noredirect"}  # noqa: S101
-        return _Response()
-
-
-class _SearchClient(_Client):
-    async def get(self, *, url, headers, params):
-        return _SearchResponse()
-
-
-def test_tmdb_group_lookup_uses_tmdb_identifier(monkeypatch) -> None:
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: _Client())
+@pytest.mark.asyncio
+async def test_combined_imdb_lookup_returns_group_and_nested_torrents(monkeypatch):
+    torrents = [{"Quality": "High Definition", "Resolution": "720p", "ReleaseName": "Example.720p"}]
+    payload = {"Page": "Browse", "TotalResults": "1", "Movies": [{"ImdbId": "9876", "GroupId": "1234", "Torrents": torrents}]}
+    client = _Client()
+    client.get = AsyncMock(return_value=httpx.Response(200, json=payload, request=httpx.Request("GET", "https://example.test")))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
     tracker = object.__new__(PassThePopcorn)
     tracker.api_user = "user"
     tracker.api_key = "key"
     tracker.user_agent = "agent"
 
-    assert asyncio.run(tracker.get_group_by_tmdb(9876)) == "1234"  # noqa: S101
+    result = await tracker.lookup_group(9876)
+    assert result.group_id == "1234"  # noqa: S101
+    assert tracker.duplicate_candidates(result, Meta(resolution="1080p")) == ["[720p] Example.720p"]  # noqa: S101
+    assert client.get.await_count == 1  # noqa: S101
+    assert client.get.await_args.kwargs["params"] == {  # noqa: S101
+        "action": "advanced", "searchstr": "https://www.imdb.com/title/tt0009876/", "json": "noredirect", "jsontrumpable": "1"
+    }
 
 
-def test_tmdb_group_lookup_filters_broad_results(monkeypatch) -> None:
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: _SearchClient())
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {}, {"Page": "Browse"}, {"Page": "Browse", "TotalResults": "1", "Movies": []},
+    {"Page": "Browse", "TotalResults": "1", "Movies": [{"ImdbId": "9999", "GroupId": "1234", "Torrents": []}]},
+    {"Page": "Browse", "TotalResults": "2", "Movies": [{"ImdbId": "9876"}, {"ImdbId": "9876"}]},
+])
+async def test_group_lookup_never_treats_unverified_results_as_absent(monkeypatch, payload):
+    client = _Client()
+    client.get = AsyncMock(return_value=httpx.Response(200, json=payload, request=httpx.Request("GET", "https://example.test")))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
     tracker = object.__new__(PassThePopcorn)
     tracker.api_user = "user"
     tracker.api_key = "key"
     tracker.user_agent = "agent"
 
-    assert asyncio.run(tracker.get_group_by_tmdb(1126341)) == "1234"  # noqa: S101
+    with pytest.raises(PTPGroupLookupError):
+        await tracker.lookup_group(9876)
+    assert not tracker._group_lookup_succeeded  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_group_lookup_accepts_only_confirmed_zero_results(monkeypatch):
+    client = _Client()
+    client.get = AsyncMock(return_value=httpx.Response(200, json={"Page": "Browse", "TotalResults": "0", "Movies": []}, request=httpx.Request("GET", "https://example.test")))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    tracker = object.__new__(PassThePopcorn)
+    tracker.api_user, tracker.api_key, tracker.user_agent = "user", "key", "agent"
+    assert (await tracker.lookup_group(9876)).group_id is None  # noqa: S101
+    assert tracker._group_lookup_succeeded  # noqa: S101
+    with pytest.raises(PTPGroupLookupError):
+        await tracker.lookup_group_for_meta(Meta(tmdb_id=123))
 
 
 def test_get_type_supports_tmdb_only_metadata() -> None:
@@ -153,12 +395,12 @@ def test_disc_menu_images_precede_movie_screenshots_in_description() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed_id, result, expired, expected", [(False, "1234", False, "1234"), (True, "1234", False, "5678"), (False, None, False, "5678"), (False, "1234", True, "5678")])
-async def test_group_prefetch_reuses_only_fresh_positive_identity_matches(monkeypatch, changed_id, result, expired, expected):
+@pytest.mark.parametrize("changed_id, result, expired, expected", [(False, PTPGroupLookup("1234", []), False, "1234"), (False, PTPGroupLookup(None, []), False, None), (True, PTPGroupLookup("1234", []), False, "5678"), (False, None, False, "5678"), (False, PTPGroupLookup("1234", []), True, "5678")])
+async def test_group_prefetch_reuses_only_fresh_identity_matches(monkeypatch, changed_id, result, expired, expected):
     import time
 
     tracker = object.__new__(PassThePopcorn)
-    tracker.get_group_by_imdb = AsyncMock(return_value="5678")
+    tracker.lookup_group_for_meta = AsyncMock(return_value=PTPGroupLookup("5678", []))
     meta = Meta(base_dir="test-group-prefetch", uuid="release", imdb_id=12345)
     task = asyncio.create_task(AsyncMock(return_value=result)())
     age = tracker._prefetch_max_age + 1 if expired else 300
@@ -167,7 +409,7 @@ async def test_group_prefetch_reuses_only_fresh_positive_identity_matches(monkey
         meta.imdb_id = 99999
 
     assert await tracker.get_group_for_meta(meta) == expected  # noqa: S101
-    assert tracker.get_group_by_imdb.await_count == (0 if expected == "1234" else 1)  # noqa: S101
+    assert tracker.lookup_group_for_meta.await_count == (1 if expected == "5678" else 0)  # noqa: S101
     assert not PassThePopcorn._group_prefetch_tasks  # noqa: S101
 
 
@@ -176,12 +418,11 @@ async def test_early_group_lookup_is_noninteractive_and_cancelled(monkeypatch):
     started = asyncio.Event()
     blocked = asyncio.Event()
 
-    async def lookup(*args, **kwargs):
-        assert kwargs["allow_selection"] is False  # noqa: S101
+    async def lookup(*_args, **_kwargs):
         started.set()
         await blocked.wait()
 
-    monkeypatch.setattr(PassThePopcorn, "_get_group_by_identifier", lookup)
+    monkeypatch.setattr(PassThePopcorn, "lookup_group", lookup)
     meta = Meta(base_dir="test-group-prefetch", uuid="release", imdb_id=12345, category="MOVIE", unattended=True, trackers=["PASSTHEPOPCORN"])
     PassThePopcorn.start_group_prefetch(meta, {"DEFAULT": {}, "TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
     task = PassThePopcorn._group_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
@@ -415,11 +656,11 @@ async def test_upload_success_does_not_wait_for_seeding_setup(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_stage", [None, "rewrite", "client"])
-async def test_ptp_result_precedes_seeding_and_followup_errors_preserve_success(monkeypatch, failure_stage):
+async def test_ptp_result_precedes_seeding_and_followup_errors_preserve_success(monkeypatch, tmp_path, failure_stage):
     import src.trackerhandle as handler
 
     events = []
-    meta = Meta(name="release", trackers=["PASSTHEPOPCORN"], print_tracker_messages=True, tracker_status={"PASSTHEPOPCORN": {"upload": True}})
+    meta = Meta(base_dir=str(tmp_path), imdb_id=12345, name="release", trackers=["PASSTHEPOPCORN"], print_tracker_messages=True, tracker_status={"PASSTHEPOPCORN": {"upload": True}})
     result_url = "https://passthepopcorn.me/torrents.php?id=1234&torrentid=5678"
 
     async def upload(*_args):
@@ -437,7 +678,10 @@ async def test_ptp_result_precedes_seeding_and_followup_errors_preserve_success(
         if failure_stage == "client":
             raise RuntimeError("client failed")
 
-    tracker = SimpleNamespace(tracker="PASSTHEPOPCORN", fill_upload_form=AsyncMock(return_value=("url", {})), upload=upload, prepare_for_seeding=rewrite)
+    tracker = SimpleNamespace(
+        tracker="PASSTHEPOPCORN", fill_upload_form=AsyncMock(return_value=("url", {})), upload=upload, prepare_for_seeding=rewrite,
+        lookup_group_for_meta=AsyncMock(return_value=PTPGroupLookup("1234", [])), duplicate_candidates=PassThePopcorn.duplicate_candidates,
+    )
     monkeypatch.setattr(handler, "PassThePopcorn", lambda **_kwargs: tracker)
     monkeypatch.setattr(handler, "TrackerSetup", lambda **_kwargs: SimpleNamespace(trackers_enabled=lambda _meta: ["PASSTHEPOPCORN"]))
     monkeypatch.setattr(handler, "provision_tracker_torrents", AsyncMock())
@@ -465,7 +709,7 @@ async def test_title_prefetch_skips_existing_groups_and_rejects_changed_tags(mon
     monkeypatch.setattr(PassThePopcorn, "_lookup_title_info", title_lookup)
     meta = Meta(base_dir="test-title-prefetch", uuid="release", category="MOVIE", unattended=True, trackers=["PASSTHEPOPCORN"], imdb_id=12345, genres=["Drama"])
     key = PassThePopcorn._prefetch_key(meta)
-    group_task = asyncio.create_task(AsyncMock(return_value=group_id)())
+    group_task = asyncio.create_task(AsyncMock(return_value=PTPGroupLookup(group_id, []))())
     PassThePopcorn._group_prefetch_tasks[key] = (PassThePopcorn._group_identity(meta), time.monotonic(), group_task)
     PassThePopcorn.start_title_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
     await asyncio.wait_for(PassThePopcorn._title_prefetch_tasks[key][2], timeout=2)
@@ -481,6 +725,157 @@ async def test_title_prefetch_skips_existing_groups_and_rejects_changed_tags(mon
 
     assert not PassThePopcorn._title_prefetch_tasks  # noqa: S101
     assert not PassThePopcorn._group_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_id, succeeded, expected_calls", [(None, True, 1), ("123", True, 0), (None, False, 0)])
+async def test_early_poster_starts_only_for_confirmed_new_groups(monkeypatch, group_id, succeeded, expected_calls):
+    async def lookup(tracker, *_args, **_kwargs):
+        if not succeeded:
+            raise PTPGroupLookupError("lookup failed")
+        return PTPGroupLookup(group_id, [])
+
+    monkeypatch.setattr(PassThePopcorn, "lookup_group", lookup)
+    start_poster = Mock()
+    monkeypatch.setattr(PassThePopcorn, "start_poster_prefetch", start_poster)
+    meta = Meta(base_dir="test-poster-prefetch", uuid="release", imdb_id=12345, category="MOVIE", unattended=True, trackers=["PTP"])
+    config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
+    try:
+        PassThePopcorn.start_group_prefetch(meta, config)
+        await PassThePopcorn._group_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
+        assert start_poster.call_count == expected_calls  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["none", "identity", "cover", "host", "expired"])
+async def test_early_poster_is_hosted_before_submission_and_reused_only_when_matching(monkeypatch, changed):
+    import time
+
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    rehost = AsyncMock(return_value="https://host.example/hosted.jpg")
+    monkeypatch.setattr(PassThePopcorn, "rehost_poster_to_selected_host", rehost)
+    meta = Meta(
+        base_dir="test-poster-prefetch", uuid="release", imdb_id=12345, category="MOVIE", unattended=True,
+        trackers=["PTP"], artwork_url="https://images.example/original.jpg", imghost="imgbb",
+    )
+    config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = config
+    try:
+        PassThePopcorn.start_poster_prefetch(meta, config)
+        key = PassThePopcorn._prefetch_key(meta)
+        snapshot, _started_at, task = PassThePopcorn._poster_prefetch_tasks[key]
+        await task
+        rehost.assert_awaited_once()
+        if changed == "identity":
+            meta.imdb_id = 99999
+        elif changed == "cover":
+            meta.artwork_url = "https://images.example/other.jpg"
+        elif changed == "host":
+            meta.imghost = "imgbox"
+        elif changed == "expired":
+            PassThePopcorn._poster_prefetch_tasks[key] = (snapshot, time.monotonic() - tracker._prefetch_max_age - 1, task)
+        assert await tracker.get_poster_for_meta(meta, meta.artwork_url) == "https://host.example/hosted.jpg"  # noqa: S101
+        assert rehost.await_count == (1 if changed == "none" else 2)  # noqa: S101
+        assert not PassThePopcorn._poster_prefetch_tasks  # noqa: S101
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+async def test_early_poster_discovers_imdb_cover_before_submission(monkeypatch):
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    cover = "https://images.example/original.jpg"
+    imdb_lookup = AsyncMock(return_value={"cover": cover})
+    monkeypatch.setattr("src.imdb.ImdbManager.get_imdb_info_api", imdb_lookup)
+    rehost = AsyncMock(return_value="https://host.example/hosted.jpg")
+    monkeypatch.setattr(PassThePopcorn, "rehost_poster_to_selected_host", rehost)
+    meta = Meta(base_dir="test-poster-discovery", uuid="release", imdb_id=12345, category="MOVIE", unattended=True, trackers=["PTP"])
+    config = {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}}
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = config
+    try:
+        PassThePopcorn.start_poster_prefetch(meta, config)
+        await PassThePopcorn._poster_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
+        imdb_lookup.assert_awaited_once()
+        rehost.assert_awaited_once()
+        meta.imdb_info = {"cover": cover}
+        assert await tracker.get_poster_for_meta(meta, cover) == "https://host.example/hosted.jpg"  # noqa: S101
+        rehost.assert_awaited_once()
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+
+
+@pytest.mark.asyncio
+async def test_cancel_prefetch_cancels_background_poster(monkeypatch):
+    monkeypatch.setattr(PassThePopcorn, "__init__", lambda _self, _config: None)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def rehost(_tracker, _meta, _cover):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(PassThePopcorn, "rehost_poster_to_selected_host", rehost)
+    meta = Meta(
+        base_dir="test-poster-cancellation", uuid="release", imdb_id=12345, category="MOVIE", unattended=True,
+        trackers=["PTP"], artwork_url="https://images.example/original.jpg",
+    )
+    try:
+        PassThePopcorn.start_poster_prefetch(meta, {"TRACKERS": {"PASSTHEPOPCORN": {"api_key": "test"}}})
+        task = PassThePopcorn._poster_prefetch_tasks[PassThePopcorn._prefetch_key(meta)][2]
+        await asyncio.wait_for(started.wait(), timeout=2)
+    finally:
+        await PassThePopcorn.cancel_prefetch(meta)
+    assert task.cancelled()  # noqa: S101
+    assert not PassThePopcorn._poster_prefetch_tasks  # noqa: S101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosted", [True, False])
+async def test_ptp_poster_preserves_original_bytes_and_url_without_shared_size_validation(monkeypatch, tmp_path, hosted):
+    cover = "https://images.example/original.jpg"
+    content = b"original poster bytes forwarded without decoding"
+    response = httpx.Response(200, content=content, headers={"content-length": "100000000"}, request=httpx.Request("GET", cover))
+    client = _Client()
+    client.get = AsyncMock(return_value=response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setattr("src.artwork.is_valid_image_bytes", Mock(side_effect=AssertionError("PTP must not apply shared image limits")))
+    tracker = object.__new__(PassThePopcorn)
+    tracker.config = {"DEFAULT": {"img_host_1": "imgbb"}}
+    uploaded = [{"raw_url": "https://host.example/hosted.jpg"}] if hosted else []
+    upload_images = AsyncMock(return_value=(uploaded, len(uploaded)))
+    tracker.uploadscreens_manager = SimpleNamespace(upload_screens=upload_images)
+    meta = Meta(base_dir=str(tmp_path), uuid="poster", imghost="imgbb")
+
+    result = await tracker.rehost_poster_to_selected_host(meta, cover)
+
+    assert result == ("https://host.example/hosted.jpg" if hosted else cover)  # noqa: S101
+    upload_images.assert_awaited_once()
+    poster_path = Path(upload_images.await_args.args[5][0])
+    assert poster_path.parent == tmp_path / "tmp" / "poster" / "artwork"  # noqa: S101
+    assert poster_path.read_bytes() == content  # noqa: S101
+    assert meta.imghost == "imgbb"  # noqa: S101
+
+
+@pytest.mark.asyncio
+async def test_existing_group_form_does_not_prepare_poster(monkeypatch):
+    tracker = object.__new__(PassThePopcorn)
+    meta = Meta(unattended=True, base_dir="test", uuid="existing-group", imdb_id=12345)
+    tracker.get_upload_anti_csrf_token = AsyncMock(return_value="token")
+    tracker.get_title_info_for_meta = AsyncMock()
+    tracker.rehost_poster_to_selected_host = AsyncMock()
+    tracker._prepare_upload_torrent = AsyncMock(return_value=b"torrent")
+    tracker._fill_upload_form = AsyncMock(return_value=("url", {"groupid": "123"}))
+    select_cover = Mock(side_effect=AssertionError("existing groups must not select a cover"))
+    monkeypatch.setattr("src.trackers.GAZELLE.passthepopcorn.select_ptp_cover_url", select_cover)
+
+    assert await tracker.fill_upload_form("123", meta) == ("url", {"groupid": "123"})  # noqa: S101
+    select_cover.assert_not_called()
+    tracker.get_title_info_for_meta.assert_not_awaited()
+    tracker.rehost_poster_to_selected_host.assert_not_awaited()
 
 
 @pytest.mark.asyncio

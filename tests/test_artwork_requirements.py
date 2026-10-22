@@ -104,10 +104,33 @@ async def test_generic_artwork_cli_args_normalize_local_images(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trackers", [["PTP"], ["ptp"], ["PASSTHEPOPCORN"], ["PTP", "PASSTHEPOPCORN"], ["PTP", "OTHER"], ["OTHER"], []])
+async def test_automatic_poster_is_deferred_only_for_ptp_only_movies(tmp_path: Path, trackers: list[str]) -> None:
+    source = BytesIO()
+    Image.new("RGB", (32, 48), "green").save(source, "JPEG")
+    url = "https://images.example/poster.jpg"
+    meta = Meta(category="MOVIE", base_dir=str(tmp_path), uuid="automatic-poster", trackers=trackers, artwork_url=url)
+
+    with (
+        patch("src.artwork.is_public_http_url", return_value=True),
+        patch("src.artwork._download_public_image", new=AsyncMock(return_value=source.getvalue())) as download,
+    ):
+        await prepare_artwork(meta)
+
+    if trackers and {tracker.upper() for tracker in trackers} <= {"PTP", "PASSTHEPOPCORN"}:
+        download.assert_not_awaited()
+        assert not meta.artwork_path
+    else:
+        download.assert_awaited_once_with(url)
+        assert Path(meta.artwork_path).is_file()
+    assert meta.artwork_url == url
+
+
+@pytest.mark.asyncio
 async def test_generic_poster_url_is_normalized_and_retained(tmp_path: Path) -> None:
     source = tmp_path / "source.jpg"
     Image.new("RGB", (32, 48), "green").save(source)
-    meta = Meta(base_dir=str(tmp_path), uuid="url-artwork", explicit_poster="https://images.example/poster.jpg")
+    meta = Meta(category="MOVIE", trackers=["PTP"], base_dir=str(tmp_path), uuid="url-artwork", explicit_poster="https://images.example/poster.jpg")
 
     with patch("src.artwork._download_public_image", new=AsyncMock(return_value=source.read_bytes())):
         await prepare_artwork(meta)
@@ -123,7 +146,7 @@ async def test_local_artwork_discovery_normalizes_named_poster_and_banner(tmp_pa
     media_file.touch()
     Image.new("RGB", (32, 48), "blue").save(tmp_path / "Release.Cover.jpg")
     Image.new("RGB", (96, 32), "red").save(tmp_path / "Release-Banner.webp")
-    meta = Meta(base_dir=str(tmp_path), uuid="discovered-artwork", path=str(media_file), artwork_url="https://metadata.example/poster.jpg")
+    meta = Meta(category="MOVIE", trackers=["PTP"], base_dir=str(tmp_path), uuid="discovered-artwork", path=str(media_file), artwork_url="https://metadata.example/poster.jpg")
 
     await prepare_artwork(meta)
 

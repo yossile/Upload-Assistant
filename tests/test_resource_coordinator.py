@@ -224,6 +224,43 @@ def test_unknown_resource_is_rejected() -> None:
         asyncio.run(acquire())
 
 
+@pytest.mark.asyncio
+async def test_exclusive_slot_serializes_coroutines_and_releases_after_errors(tmp_path: Path) -> None:
+    events = []
+
+    async def hold(name: str) -> None:
+        with contextlib.suppress(ValueError):
+            async with rc.exclusive_slot("ptp-submission", tmp_path):
+                events.append(f"start:{name}")
+                await asyncio.sleep(0)
+                events.append(f"end:{name}")
+                raise ValueError("release on error")
+
+    await asyncio.wait_for(asyncio.gather(hold("first"), hold("second")), timeout=5)
+    assert events == ["start:first", "end:first", "start:second", "end:second"]
+
+
+def test_exclusive_slot_is_process_shared_and_releases_when_holder_dies(tmp_path: Path) -> None:
+    script = CHILD_SCRIPT.replace('rc.resource_slot("torrent-hash", "test")', 'rc.exclusive_slot("ptp-submission", rc.LOCK_DIR)')
+    log = tmp_path / "events.log"
+    holder = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(log), "holder", str(tmp_path / "never")], cwd=REPO_ROOT)
+    try:
+        _wait_for(lambda: "start holder" in _events(log))
+        assert rc._try_lock(tmp_path / "ptp-submission.lock") is None
+        holder.kill()
+        holder.wait(timeout=30)
+
+        async def acquire() -> None:
+            async with rc.exclusive_slot("ptp-submission", tmp_path):
+                pass
+
+        asyncio.run(asyncio.wait_for(acquire(), timeout=5))
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=30)
+
+
 @pytest.mark.parametrize("bandwidth_control", [True, False])
 @pytest.mark.parametrize("order", ["usenet", "tracker", "concurrent"])
 def test_upload_order_holds_bandwidth_slot_only_when_enabled(monkeypatch: pytest.MonkeyPatch, order: str, bandwidth_control: bool) -> None:

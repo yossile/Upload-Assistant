@@ -156,6 +156,21 @@ def _unlock(lock_file: BinaryIO) -> None:
         lock_file.close()
 
 
+@contextlib.asynccontextmanager
+async def exclusive_slot(name: str, lock_dir: Path) -> AsyncGenerator[None]:
+    """Serialize processes and coroutines without joining an existing process hold."""
+    lock_file = None
+    try:
+        while lock_file is None:
+            lock_file = _try_lock(lock_dir / f"{name}.lock")
+            if lock_file is None:
+                await asyncio.sleep(0.1)
+        yield
+    finally:
+        if lock_file is not None:
+            _unlock(lock_file)
+
+
 def _join_existing_hold(name: str) -> bool:
     with _state_lock:
         hold = _holds.get(name)

@@ -10,7 +10,9 @@ class LookupReached(Exception):
     pass
 
 
-def test_douban_lookup_uses_imdb_id_from_attended_prompt(monkeypatch):
+@pytest.mark.parametrize("tmdb_id", [0, 12345])
+@pytest.mark.parametrize("imdb_id", [0, None])
+def test_douban_lookup_uses_imdb_id_from_attended_prompt(monkeypatch, tmdb_id, imdb_id):
     events = []
 
     class TrackerSetup:
@@ -50,7 +52,8 @@ def test_douban_lookup_uses_imdb_id_from_attended_prompt(monkeypatch):
         tracker_status={},
         unattended=False,
         no_imdb=False,
-        imdb_id=0,
+        imdb_id=imdb_id,
+        tmdb_id=tmdb_id,
         imdb_tt="",
     )
 

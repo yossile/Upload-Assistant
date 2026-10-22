@@ -92,6 +92,16 @@ When several uploads run at once (WebUI tabs or separate CLI runs), bandwidth-co
 
 Only uploads with bandwidth control enabled take part. With `qbit_bandwidth_control` enabled in the configuration, that is every upload. With it disabled, only runs started with `-qbcon` wait their turn; uploads without it continue with no qBittorrent restriction.
 
+### PTP submission coordination
+
+PTP submissions always take turns across Upload Assistant workers and CLI runs using the same state directory, independently of bandwidth control. Metadata, screenshots, and early cover preparation can run concurrently. The exclusive PTP submission lock covers a fresh IMDb group/duplicate lookup, final form preparation, and the upload response. Local torrent finalization and client injection happen after releasing it.
+
+The fresh lookup retrieves the group and its torrents in one advanced IMDb search. A waiting release uses the group created by an earlier release, or is skipped if a conflicting duplicate appeared. Failed, ambiguous, or malformed searches do not authorize creating a new group. Automatic group discovery requires an IMDb ID; TMDb metadata alone is not sufficient. Interactive runs prompt for missing IMDb, unless `--no-imdb` is set; unattended runs skip PTP if IMDb remains unavailable.
+
+If a POST times out, is interrupted, or returns an unrecognized response, Upload Assistant retains `tmp/locks/ptp-pending-<IMDb number>.json` under the state directory. Later submissions for that IMDb stop rather than blindly retrying. Check PTP to establish whether the upload succeeded, resume seeding manually if necessary, then remove the indicated pending record before retrying. Do not remove it while the original upload is still running. Explicit site rejection or confirmed success clears the record automatically.
+
+This lock does not coordinate independent upload tools or runs using different state directories.
+
 ## Command-line overrides
 
 The equivalent CLI options are:

@@ -225,6 +225,13 @@ async def prepare_artwork(meta: Meta) -> None:
             source = source_path
         elif value and urlparse(value).scheme in {"http", "https"}:
             source = await _download_public_image(value)
+        elif (
+            kind == "poster"
+            and meta.category == "MOVIE"
+            and meta.trackers
+            and {str(tracker).strip().upper() for tracker in meta.trackers} <= {"PTP", "PASSTHEPOPCORN"}
+        ):
+            continue
         elif kind == "poster" and is_public_http_url(meta.artwork_url):
             source = await _download_public_image(meta.artwork_url)
         elif value:

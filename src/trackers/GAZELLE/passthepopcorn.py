@@ -8,9 +8,11 @@ import platform
 import re
 import time
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import aiofiles
 import cli_ui
@@ -38,6 +40,16 @@ from src.torrent_policy import PASSTHEPOPCORN_POLICY
 from src.tracker_images import get_tracker_image_collection
 from src.trackers.common import Common
 from src.uploadscreens import UploadScreensManager
+
+
+@dataclass(frozen=True)
+class PTPGroupLookup:
+    group_id: str | None
+    torrents: list[dict[str, Any]]
+
+
+class PTPGroupLookupError(UploadError):
+    pass
 
 
 class PassThePopcorn:
@@ -144,9 +156,10 @@ class PassThePopcorn:
     torrent_policy = PASSTHEPOPCORN_POLICY
     tracker_urls = ("passthepopcorn.me",)
     _prefetch_max_age = 3600.0
-    _group_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[tuple[str, str], float, asyncio.Task[str | None]]]] = {}
+    _group_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[tuple[str, str], float, asyncio.Task[PTPGroupLookup | None]]]] = {}
     _title_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[Meta, float, asyncio.Task[dict[str, Any] | None]]]] = {}
     _auth_prefetch_tasks: ClassVar[dict[tuple[str, str], asyncio.Task[tuple[str, float] | None]]] = {}
+    _poster_prefetch_tasks: ClassVar[dict[tuple[str, str], tuple[Meta, float, asyncio.Task[str | None]]]] = {}
 
     @staticmethod
     def _prefetch_key(meta: Meta) -> tuple[str, str]:
@@ -155,9 +168,9 @@ class PassThePopcorn:
     @staticmethod
     def _group_identity(meta: Meta) -> tuple[str, str] | None:
         if meta.imdb_id and not meta.no_imdb:
-            return "imdb", str(meta.imdb_id).removeprefix("tt").zfill(7)
-        if meta.tmdb_id:
-            return "tmdb", str(meta.tmdb_id)
+            imdb_id = str(meta.imdb_id).removeprefix("tt")
+            if imdb_id.isdigit() and int(imdb_id) > 0:
+                return "imdb", imdb_id.zfill(7)
         return None
 
     @classmethod
@@ -183,19 +196,15 @@ class PassThePopcorn:
         if key in cls._group_prefetch_tasks:
             return
 
-        async def lookup() -> str | None:
+        async def lookup() -> PTPGroupLookup | None:
             try:
                 tracker = cls(config)
                 started_at = time.perf_counter()
-                group_id = await tracker._get_group_by_identifier(
-                    {identity[0]: identity[1], "json": "noredirect"},
-                    f"{identity[0].upper()}: {identity[1]}",
-                    "TmdbId" if identity[0] == "tmdb" else None,
-                    identity[1] if identity[0] == "tmdb" else None,
-                    allow_selection=False,
-                )
+                result = await tracker.lookup_group(identity[1])
                 log_ptp_timing(meta, "early group lookup", started_at)
-                return group_id
+                if result.group_id is None:
+                    cls.start_poster_prefetch(meta, config)
+                return result
             except Exception as error:
                 logger.debug(f"{cls.tracker}: Early group lookup failed: {error}")
                 return None
@@ -211,22 +220,21 @@ class PassThePopcorn:
             await asyncio.gather(task, return_exceptions=True)
 
     async def get_group_for_meta(self, meta: Meta) -> str | None:
+        return (await self.get_initial_group_lookup(meta)).group_id
+
+    async def get_initial_group_lookup(self, meta: Meta) -> PTPGroupLookup:
         pending = self._group_prefetch_tasks.pop(self._prefetch_key(meta), None)
         identity = self._group_identity(meta)
         if pending is not None:
             cached_identity, started_at, task = pending
             if identity == cached_identity and time.monotonic() - started_at < self._prefetch_max_age and not task.cancelled():
-                group_id = await task
-                if group_id is not None:
-                    return group_id
+                result = await task
+                if result is not None:
+                    return result
             else:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        if identity is None:
-            return None
-        if identity[0] == "imdb":
-            return await self.get_group_by_imdb(identity[1])
-        return await self.get_group_by_tmdb(identity[1])
+        return await self.lookup_group_for_meta(meta)
 
     @classmethod
     def start_title_prefetch(cls, meta: Meta, config: dict[str, Any]) -> None:
@@ -241,8 +249,8 @@ class PassThePopcorn:
         async def lookup() -> dict[str, Any] | None:
             try:
                 if pending_group is not None and pending_group[0] == cls._group_identity(snapshot):
-                    group_id = await asyncio.shield(pending_group[2])
-                    if group_id is not None:
+                    group_lookup = await asyncio.shield(pending_group[2])
+                    if group_lookup is not None and group_lookup.group_id is not None:
                         return None
                 started_at = time.perf_counter()
                 result = await cls(config)._lookup_title_info(snapshot)
@@ -312,10 +320,70 @@ class PassThePopcorn:
         return await self.get_anti_csrf_token(meta)
 
     @classmethod
+    def start_poster_prefetch(cls, meta: Meta, config: dict[str, Any]) -> None:
+        if not cls._can_prefetch(meta, config) or meta.debug:
+            return
+        key = cls._prefetch_key(meta)
+        if key in cls._poster_prefetch_tasks:
+            return
+        snapshot = meta.copy()
+
+        async def prepare() -> str | None:
+            try:
+                started_at = time.perf_counter()
+                cover = select_ptp_cover_url(snapshot)
+                if cover is None and snapshot.imdb_id and not snapshot.no_imdb:
+                    from src.imdb import ImdbManager
+
+                    snapshot.imdb_info = await ImdbManager().get_imdb_info_api(
+                        snapshot.imdb_id, manual_language=snapshot.manual_language, base_dir=snapshot.base_dir, config=config
+                    )
+                    cover = select_ptp_cover_url(snapshot)
+                if cover is None:
+                    return None
+                result = await cls(config).rehost_poster_to_selected_host(snapshot, cover)
+                log_ptp_timing(snapshot, "early poster download and hosting", started_at)
+                return result
+            except Exception as error:
+                logger.debug(f"{cls.tracker}: Early poster preparation failed: {error}")
+                return None
+
+        cls._poster_prefetch_tasks[key] = (snapshot, time.monotonic(), asyncio.create_task(prepare()))
+
+    @classmethod
+    async def cancel_poster_prefetch(cls, meta: Meta) -> None:
+        pending = cls._poster_prefetch_tasks.pop(cls._prefetch_key(meta), None)
+        if pending is not None:
+            task = pending[2]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def get_poster_for_meta(self, meta: Meta, cover: str) -> str:
+        pending = self._poster_prefetch_tasks.pop(self._prefetch_key(meta), None)
+        if pending is not None:
+            snapshot, started_at, task = pending
+            unchanged = (
+                self._group_identity(meta) == self._group_identity(snapshot)
+                and meta.explicit_poster == snapshot.explicit_poster
+                and self._selected_poster_host(meta) == self._selected_poster_host(snapshot)
+                and meta.skip_imghost_upload == snapshot.skip_imghost_upload
+                and (select_ptp_cover_url(snapshot) is None or cover == select_ptp_cover_url(snapshot))
+            )
+            if unchanged and time.monotonic() - started_at < self._prefetch_max_age and not task.cancelled():
+                result = await task
+                if result is not None and cover == select_ptp_cover_url(snapshot):
+                    return result
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return await self.rehost_poster_to_selected_host(meta, cover)
+
+    @classmethod
     async def cancel_prefetch(cls, meta: Meta) -> None:
         await cls.cancel_auth_prefetch(meta)
         await cls.cancel_title_prefetch(meta)
         await cls.cancel_group_prefetch(meta)
+        await cls.cancel_poster_prefetch(meta)
 
     async def _lookup_title_info(self, meta: Meta) -> dict[str, Any]:
         identity = self._group_identity(meta)
@@ -521,116 +589,70 @@ class PassThePopcorn:
         return imagelist if meta.keep_images else []
 
     async def get_group_by_imdb(self, imdb: int | str) -> str | None:
-        params = {
-            "imdb": imdb,
-            "json": "noredirect",
-        }
-        return await self._get_group_by_identifier(params, f"IMDb: tt{imdb}")
+        return (await self.lookup_group(imdb)).group_id
 
-    async def get_group_by_tmdb(self, tmdb: int | str) -> str | None:
-        params = {
-            "tmdb": tmdb,
-            "json": "noredirect",
-        }
-        return await self._get_group_by_identifier(params, f"TMDB: {tmdb}", "TmdbId", tmdb, allow_selection=False)
+    async def lookup_group_for_meta(self, meta: Meta) -> PTPGroupLookup:
+        identity = self._group_identity(meta)
+        if identity is None:
+            raise PTPGroupLookupError("PTP group discovery requires a valid IMDb ID.")
+        return await self.lookup_group(identity[1])
 
-    async def _get_group_by_identifier(
-        self,
-        params: dict[str, int | str],
-        identifier_label: str,
-        response_identifier_key: str | None = None,
-        response_identifier: int | str | None = None,
-        allow_selection: bool = True,
-    ) -> str | None:
-        headers = {"ApiUser": self.api_user, "ApiKey": self.api_key, "User-Agent": self.user_agent}
+    async def lookup_group(self, imdb: int | str) -> PTPGroupLookup:
+        self._group_lookup_succeeded = False
+        imdb_id = str(imdb).removeprefix("tt")
+        if not imdb_id.isdigit() or int(imdb_id) <= 0:
+            raise PTPGroupLookupError("PTP group discovery requires a valid IMDb ID.")
+        imdb_id = imdb_id.zfill(7)
+        params = {
+            "action": "advanced",
+            "searchstr": f"https://www.imdb.com/title/tt{imdb_id}/",
+            "json": "noredirect",
+            "jsontrumpable": "1",
+        }
+        headers: dict[str, str] = {"ApiUser": self.api_user, "ApiKey": self.api_key, "User-Agent": self.user_agent}
         url = f"{self.base_url}/torrents.php"
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(url=url, headers=headers, params=params)
-        await asyncio.sleep(1)
         try:
-            if response.status_code != 200:
-                logger.info(f"{self.tracker}: [red]group lookup failed with HTTP {response.status_code}[/red]")
-                if response.text:
-                    logger.info(f"{self.tracker}: [red]Response body (truncated): {response.text[:200]}[/red]")
-                return None
-
-            try:
-                response_data = response.json()
-            except json.JSONDecodeError:
-                content_type = response.headers.get("content-type", "unknown")
-                logger.info(f"{self.tracker}: [red]group lookup returned non-JSON content (content-type: {content_type})[/red]")
-                if response.text:
-                    logger.info(f"{self.tracker}: [red]Response body (truncated): {response.text[:200]}[/red]")
-                return None
-
-            if response_data.get("TotalResults"):  # Search results page
-                movies = cast(list[dict[str, Any]], response_data.get("Movies", []))
-                if response_identifier_key is not None and response_identifier is not None:
-                    expected_identifier = str(response_identifier)
-                    movies = [movie for movie in movies if str(movie.get(response_identifier_key, "")) == expected_identifier]
-                total_results = len(movies)
-                if total_results == 0:
-                    logger.info(f"{self.tracker}: [yellow]No results found for {identifier_label}[/yellow]")
-                    return None
-                if total_results == 1:
-                    # Single result - use it
-                    movie = movies[0]
-                    group_id: str | None = str(movie.get("GroupId")) if movie.get("GroupId") is not None else None
-                    title = movie.get("Title", "Unknown")
-                    year = movie.get("Year", "Unknown")
-                    logger.info(f"{self.tracker}: [green]Found single match for {identifier_label} -> Group ID: [yellow]{group_id}[/yellow][/green]")
-                    logger.info(f"{self.tracker}: [green]Title: [yellow]{title}[/yellow] ([yellow]{year}[/yellow])")
-                    return group_id
-                if not allow_selection:
-                    logger.info(f"{self.tracker}: [yellow]Multiple groups matched {identifier_label}; creating a new group instead of prompting.[/yellow]")
-                    return None
-                # Multiple results - let user choose
-                logger.info(f"{self.tracker}: [yellow]Found {total_results} matches for {identifier_label}[/yellow]")
-                choices: list[str] = []
-                for _i, movie in enumerate(movies):
-                    title = movie.get("Title", "Unknown")
-                    year = movie.get("Year", "Unknown")
-                    group_id = movie.get("GroupId", "Unknown")
-                    choice_text = f"{title} ({year}) - Group ID: {group_id}"
-                    choices.append(choice_text)
-
-                choices.append("Skip - Don't use any of these matches")
-
-                try:
-                    selected = await prompt_in_thread(cli_ui.ask_choice, "Select the correct movie:", choices=choices)
-                    if selected == "Skip - Don't use any of these matches":
-                        logger.info(f"{self.tracker}: [yellow]User chose to skip all matches[/yellow]")
-                        return None
-
-                    # Match selection directly to movie data to avoid index issues from cli_ui sorting
-                    group_id = None
-                    for movie in movies:
-                        title = movie.get("Title", "Unknown")
-                        year = movie.get("Year", "Unknown")
-                        group_id = movie.get("GroupId", "Unknown")
-                        if f"{title} ({year}) - Group ID: {group_id}" == selected:
-                            group_id = str(group_id)
-                            break
-
-                    logger.info(f"{self.tracker}: [green]User selected: Group ID [yellow]{group_id}[/yellow][/green]")
-                    return group_id
-
-                except KeyboardInterrupt:
-                    logger.info(f"{self.tracker}: [yellow]Selection cancelled by user[/yellow]")
-                    return None
-            elif response_data.get("Page") == "Browse":  # No Releases on Site with ID
-                return None
-            elif response_data.get("Page") == "Details":  # Group Found
-                group_id = response_data.get("GroupId")
-                logger.info(f"{self.tracker}: [green]Matched {identifier_label} to Group ID: [yellow]{group_id}[/yellow][/green]")
-                logger.info(f"{self.tracker}: [green]Title: [yellow]{response_data.get('Name')}[/yellow] ([yellow]{response_data.get('Year')}[/yellow])")
-                return str(group_id) if group_id is not None else None
-        except Exception:
-            logger.info(f"{self.tracker}: [red]An error has occurred trying to find a group ID")
-            logger.info(f"{self.tracker}: [red]Please check that the site is online and your ApiUser/api_key values are correct")
-            return None
-
-        return None
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(url=url, headers=headers, params=params)
+            response.raise_for_status()
+            raw_data: Any = response.json()
+            if not isinstance(raw_data, dict):
+                raise PTPGroupLookupError("PTP returned an unexpected group search response.")
+            data = cast(dict[str, Any], raw_data)
+            if data.get("Page") != "Browse":
+                raise PTPGroupLookupError("PTP returned an unexpected group search response.")
+            total = data.get("TotalResults")
+            if isinstance(total, bool) or not str(total).isdigit():
+                raise PTPGroupLookupError("PTP group search did not return a valid result count.")
+            result_count = int(str(total))
+            raw_movies = data.get("Movies")
+            if not isinstance(raw_movies, list):
+                raise PTPGroupLookupError("PTP group search returned incomplete results.")
+            movies = cast(list[Any], raw_movies)
+            if len(movies) != result_count:
+                raise PTPGroupLookupError("PTP group search returned incomplete results.")
+            if result_count == 0:
+                self._group_lookup_succeeded = True
+                return PTPGroupLookup(None, [])
+            if any(not isinstance(movie, dict) for movie in movies):
+                raise PTPGroupLookupError("PTP group search returned malformed movies.")
+            matches = [movie for movie in cast(list[dict[str, Any]], movies) if str(movie.get("ImdbId", "")).removeprefix("tt").zfill(7) == imdb_id]
+            if len(matches) != 1:
+                raise PTPGroupLookupError("PTP group search did not identify one exact IMDb match.")
+            movie = matches[0]
+            group_id = str(movie.get("GroupId", ""))
+            raw_torrents = movie.get("Torrents")
+            if not group_id.isdigit() or int(group_id) <= 0 or not isinstance(raw_torrents, list):
+                raise PTPGroupLookupError("PTP group search returned invalid group or torrent data.")
+            torrents = cast(list[dict[str, Any]], raw_torrents)
+            if any(not isinstance(torrent, dict) for torrent in torrents):
+                raise PTPGroupLookupError("PTP group search returned invalid group or torrent data.")
+            if any(not all(isinstance(torrent.get(field), str) and torrent[field] for field in ("Quality", "Resolution", "ReleaseName")) for torrent in torrents):
+                raise PTPGroupLookupError("PTP group search returned incomplete torrent metadata.")
+            self._group_lookup_succeeded = True
+            return PTPGroupLookup(group_id, torrents)
+        except (httpx.HTTPError, ValueError) as error:
+            raise PTPGroupLookupError(f"PTP group search failed: {error}") from error
 
     async def get_torrent_info(self, imdb: int | str, meta: Meta) -> dict[str, Any]:
         params = {"imdb": imdb, "action": "torrent_info", "fast": 1}
@@ -714,6 +736,13 @@ class PassThePopcorn:
         return tags
 
     async def search_existing(self, group_id: int | str, meta: Meta) -> list[str]:
+        result = await self.lookup_group_for_meta(meta)
+        if group_id and str(group_id) != result.group_id:
+            logger.debug(f"{self.tracker}: Group changed during duplicate recheck; using the fresh IMDb result.")
+        return self.duplicate_candidates(result, meta)
+
+    @staticmethod
+    def duplicate_candidates(result: PTPGroupLookup, meta: Meta) -> list[str]:
         # Map resolutions to SD / HD / UHD
         quality = None
         if meta.sd == 1:  # 1 is SD
@@ -723,35 +752,11 @@ class PassThePopcorn:
         elif meta.resolution in ["2160p", "4320p", "8640p"]:
             quality = "Ultra High Definition"
 
-        # Prepare request parameters and headers
-        params = {
-            "id": group_id,
-            "json": "1",
-            "jsontrumpable": "1",
-        }
-        headers = {"ApiUser": self.api_user, "ApiKey": self.api_key, "User-Agent": self.user_agent}
-        url = f"{self.base_url}/torrents.php"
-
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers, params=params)
-            await asyncio.sleep(1)  # Mimic server-friendly delay
-            response.raise_for_status()
-            existing: list[str] = []
-            try:
-                data = response.json()
-            except Exception as e:
-                logger.info(f"{self.tracker}: [red]Error searching for duplicates, response was not valid JSON: {e}[/red]")
-                if response.text:
-                    logger.info(f"{self.tracker}: [red]Response body (truncated): {response.text[:200]}[/red]")
-                return existing
-
-            torrents = cast(list[dict[str, Any]], data.get("Torrents", []))
-            existing.extend(
-                f"[{torrent.get('Resolution')}] {torrent.get('ReleaseName', 'RELEASE NAME NOT FOUND')}"
-                for torrent in torrents
-                if torrent.get("Quality") == quality and quality is not None
-            )
-            return existing
+        return [
+            f"[{torrent.get('Resolution')}] {torrent.get('ReleaseName', 'RELEASE NAME NOT FOUND')}"
+            for torrent in result.torrents
+            if torrent.get("Quality") == quality and quality is not None
+        ]
 
     def _selected_poster_host(self, meta: Meta) -> str:
         default_config = cast(dict[str, Any], self.config.get("DEFAULT", {}))
@@ -801,7 +806,7 @@ class PassThePopcorn:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            poster_path = tmp_dir / f"PTP_POSTER{self._poster_extension(image_url, response.headers.get('content-type', ''))}"
+            poster_path = tmp_dir / f"PTP_POSTER_{uuid4().hex}{self._poster_extension(image_url, response.headers.get('content-type', ''))}"
             await asyncio.to_thread(poster_path.write_bytes, response.content)
 
             original_imghost = meta.imghost
@@ -1702,7 +1707,7 @@ class PassThePopcorn:
                 prerequisites["metadata"] = asyncio.create_task(timed("PTP title metadata lookup", self.get_title_info_for_meta(snapshot)))
                 cover = select_ptp_cover_url(snapshot)
                 if cover is not None:
-                    prerequisites["poster"] = asyncio.create_task(timed("poster download and hosting", self.rehost_poster_to_selected_host(snapshot, cover)))
+                    prerequisites["poster"] = asyncio.create_task(timed("poster download and hosting", self.get_poster_for_meta(snapshot, cover)))
         form_task = asyncio.create_task(self._fill_upload_form(group_id, meta, prerequisites))
         torrent_task = asyncio.create_task(self._prepare_upload_torrent(meta))
         tasks = [form_task, torrent_task, *prerequisites.values()]
@@ -1855,7 +1860,7 @@ class PassThePopcorn:
                 cover = await prerequisites["poster"]
             elif cover is not None:
                 poster_started_at = time.perf_counter()
-                cover = await self.rehost_poster_to_selected_host(meta, cover)
+                cover = await self.get_poster_for_meta(meta, cover)
                 log_ptp_timing(meta, "poster download and hosting", poster_started_at)
             while cover is None:
                 if meta.unattended and not meta.unattended_confirm:
@@ -2001,6 +2006,7 @@ class PassThePopcorn:
             if error_message:
                 status_message += f" | {error_message}"
             meta.tracker_status[self.tracker]["status_message"] = status_message
+            meta.tracker_status[self.tracker]["submission_rejected"] = bool(error_message)
             if error_message and re.search(r'\bthe same base save path\s+"[^"]+"\s+already exists on the site\b', error_message, re.IGNORECASE):
                 meta.tracker_status[self.tracker]["dupe"] = True
             return False
