@@ -55,6 +55,9 @@ class _ProxyResponseError(Exception):
 class QbittorrentClientMixin:
     config: dict[str, Any]
 
+    def get_inject_delay(self, tracker: str) -> int:
+        raise NotImplementedError
+
     def _extract_tracker_ids_from_comment(self, comment: str) -> dict[str, str]:
         raise NotImplementedError
 
@@ -1119,12 +1122,9 @@ class QbittorrentClientMixin:
         logger.debug(f"Content Layout: {content_layout}")
         logger.debug(f"[bold yellow]qBittorrent save path: {save_path}")
 
-        if cross:
-            skip_checking = True
-            paused_on_add = True
-        else:
-            skip_checking = True
-            paused_on_add = False
+        inject_delay = self.get_inject_delay(tracker) if not cross else 0
+        skip_checking = True
+        paused_on_add = cross or inject_delay > 0
         tag = None
         if cross and client.get("qbit_cross_tag"):
             tag = client["qbit_cross_tag"]
@@ -1147,6 +1147,7 @@ class QbittorrentClientMixin:
                     "autoTMM": str(auto_management).lower(),
                     "skip_checking": str(skip_checking).lower(),
                     "paused": str(paused_on_add).lower(),
+                    "stopped": str(paused_on_add).lower(),
                     "contentLayout": content_layout,
                 }
                 if qbt_category:
@@ -1243,6 +1244,9 @@ class QbittorrentClientMixin:
             logger.debug(f"[green]Successfully added torrent to qBittorrent ({tracker})[/green]")
 
         if not cross:
+            if inject_delay > 0:
+                logger.info(f"{tracker}: [cyan]Torrent added stopped; waiting {inject_delay} seconds before starting in qBittorrent[/cyan]")
+                await asyncio.sleep(inject_delay)
             try:
                 if proxy_url:
                     if qbt_session is None:

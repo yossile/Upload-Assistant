@@ -348,7 +348,7 @@ Implementation notes:
 - `show_upload_duration` (bool): Print how long each tracker upload took.
 - `print_tracker_messages` (bool): Print tracker API messages returned during upload.
 - `print_tracker_links` (bool): Print direct torrent links after upload.
-- `inject_delay` (int): Delay (in seconds) before injecting the torrent to allow the tracker to register the hash and avoid 'unregistered torrent' errors.
+- `inject_delay` (int): Delay (in seconds) to allow the tracker to register the hash and avoid 'unregistered torrent' errors. For qBittorrent, a positive delay adds the torrent immediately in a stopped state, then starts it after the delay once addition is confirmed. Cross-seeds remain stopped. Other clients and watch folders wait before adding the torrent. A value of `0` disables the delay.
 
 Implementation notes:
 

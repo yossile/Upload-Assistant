@@ -102,6 +102,38 @@ def test_empty_inject_delay_is_a_no_op() -> None:
     assert sleep_calls == 0
 
 
+@pytest.mark.parametrize("torrent_client", ["qbit", "rtorrent", "deluge", "transmission", "watch"])
+def test_add_to_client_only_skips_pre_add_delay_for_qbittorrent(tmp_path: Path, torrent_client: str) -> None:
+    clients = Clients({"DEFAULT": {"inject_delay": 5}, "TRACKERS": {"TEST": {}}, "TORRENT_CLIENTS": {"test": {"torrent_client": torrent_client}}})
+    meta = Meta(base_dir=str(tmp_path), uuid="delayed", path=str(tmp_path / "video.mkv"), client="test")
+    torrent_path = tmp_path / "tmp" / meta.uuid / "[TEST].torrent"
+    torrent_path.parent.mkdir(parents=True)
+    torrent_path.touch()
+    events = []
+
+    async def record_delay(*_args):
+        events.append("delay")
+
+    def record_add(*_args):
+        events.append("add")
+
+    with (
+        patch("src.clients.Torrent.read"),
+        patch.object(clients, "inject_delay", AsyncMock(side_effect=record_delay)),
+        patch.object(clients, "remote_path_map", AsyncMock(return_value=(str(tmp_path), str(tmp_path)))),
+        patch.object(clients, "qbittorrent", AsyncMock(side_effect=record_add)),
+        patch.object(clients, "rtorrent", side_effect=record_add),
+        patch.object(clients, "deluge", side_effect=record_add),
+        patch.object(clients, "transmission", side_effect=record_add),
+        patch("src.clients.shutil.copy", side_effect=record_add),
+        patch("src.clients.record_event_async", AsyncMock()),
+    ):
+        clients.config["TORRENT_CLIENTS"]["test"]["watch_folder"] = str(tmp_path)
+        asyncio.run(clients.add_to_client(meta, "TEST"))
+
+    assert events == (["add"] if torrent_client == "qbit" else ["delay", "add"])
+
+
 @pytest.mark.parametrize("tracker_settings,expected", [({}, [3]), ({"inject_delay": None}, [3]), ({"inject_delay": 0}, []), ({"inject_delay": 2}, [2])])
 def test_inject_delay_inherits_only_when_unset_or_none(tracker_settings, expected) -> None:
     sleep_calls = []

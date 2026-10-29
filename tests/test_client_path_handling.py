@@ -105,6 +105,61 @@ async def test_torrent_links_reject_existing_different_file(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_proxy", [False, True])
+@pytest.mark.parametrize("delay,cross", [(5, False), (0, False), (5, True)])
+async def test_qbittorrent_delay_happens_between_stopped_add_and_start(tmp_path, use_proxy, delay, cross):
+    video = tmp_path / "fictional.mkv"
+    video.write_bytes(b"fictional video")
+    torrent = Torrent(path=video)
+    torrent.generate()
+    meta = Meta(path=str(video), filelist=[str(video)])
+    client = Clients({"DEFAULT": {"inject_delay": delay}, "TRACKERS": {"EXAMPLE": {}}})
+    events = []
+
+    async def record_add(*args):
+        options = args[3] if use_proxy else args[2]
+        if use_proxy:
+            assert options["paused"] == options["stopped"] == str(cross or delay > 0).lower()
+        else:
+            assert options["is_paused"] == options["is_stopped"] == options["paused"] == (cross or delay > 0)
+        events.append("add")
+
+    async def record_sleep(seconds):
+        assert seconds == delay
+        events.append("sleep")
+
+    async def record_start(*_args, **_kwargs):
+        events.append("start")
+        return SimpleNamespace(status_code=200)
+
+    qbt = SimpleNamespace(torrents_resume=lambda *_args: None)
+
+    async def record_operation(_operation, description, **_kwargs):
+        if description == "Resume torrent":
+            events.append("start")
+        return [object()]
+
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: [{"hash": torrent.infohash}])),
+        post=AsyncMock(side_effect=record_start),
+        aclose=AsyncMock(),
+    )
+    config = {"qui_proxy_url": "https://qbit.invalid"} if use_proxy else {}
+    with (
+        patch.object(client, "init_qbittorrent_client", AsyncMock(return_value=qbt)),
+        patch.object(client, "_add_torrent_direct", AsyncMock(side_effect=record_add)),
+        patch.object(client, "_add_torrent_via_proxy", AsyncMock(side_effect=record_add)),
+        patch.object(client, "retry_qbt_operation", AsyncMock(side_effect=record_operation)),
+        patch.object(client, "create_ssl_context_for_client", return_value=None),
+        patch("src.torrent_clients.qbittorrent.httpx.AsyncClient", return_value=session),
+        patch("src.torrent_clients.qbittorrent.asyncio.sleep", side_effect=record_sleep),
+    ):
+        await client.qbittorrent(str(video), torrent, str(tmp_path), str(tmp_path), config, "", meta.filelist, meta, "EXAMPLE", cross)
+
+    assert events == (["add"] if cross else ["add", "sleep", "start"] if delay else ["add", "start"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("layout", ["singlefile", "multifile-video", "multifile-subtitles"])
 @pytest.mark.parametrize("file_input", [False, True])
 @pytest.mark.parametrize("keep_folder", [False, True])

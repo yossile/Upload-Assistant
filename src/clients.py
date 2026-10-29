@@ -198,7 +198,8 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
 
             client = clients_config[client_name]
             torrent_client = client["torrent_client"]
-            await self.inject_delay(meta, tracker, client_name)
+            if torrent_client != "qbit":
+                await self.inject_delay(meta, tracker, client_name)
 
             # Must pass client_name to remote_path_map
             local_path, remote_path = await self.remote_path_map(meta, client_name)
@@ -240,12 +241,19 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
         By waiting before injection, this function helps ensure proper tracker
         synchronization and more reliable peer discovery.
         """
+        inject_delay = self.get_inject_delay(tracker)
+        if inject_delay > 0:
+            if meta.debug or inject_delay > 5:
+                logger.info(f"{tracker}: [cyan]Waiting {inject_delay} seconds before adding to client '{client_name}'[/cyan]")
+            await asyncio.sleep(inject_delay)
+
+    def get_inject_delay(self, tracker: str) -> int:
         tracker_cfg = self.config.get("TRACKERS", {}).get(tracker, {})
         # None retains the setting while inheriting DEFAULT; 0 still disables it.
         has_tracker_delay = isinstance(tracker_cfg, dict) and tracker_cfg.get("inject_delay") is not None
-        inject_delay = tracker_cfg.get("inject_delay") if has_tracker_delay else self.config["DEFAULT"].get("inject_delay", 0)
+        inject_delay = tracker_cfg.get("inject_delay") if has_tracker_delay else self.config.get("DEFAULT", {}).get("inject_delay", 0)
         if inject_delay is None or (isinstance(inject_delay, str) and not inject_delay.strip()):
-            return
+            return 0
 
         try:
             inject_delay = int(inject_delay)
@@ -259,13 +267,7 @@ class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, Tr
         if inject_delay < 0:
             logger.info("[bold red]CONFIG ERROR: 'inject_delay' must be >= 0")
             inject_delay = 0
-        if inject_delay > 0:
-            if meta.debug or inject_delay > 5:
-                if has_tracker_delay:
-                    logger.info(f"{tracker}: [cyan]Waiting {inject_delay} seconds before adding to client '{client_name}'[/cyan]")
-                else:
-                    logger.info(f"[cyan]Waiting {inject_delay} seconds before adding to client '{client_name}'[/cyan]")
-            await asyncio.sleep(inject_delay)
+        return inject_delay
 
     async def find_existing_torrents(self, meta: Meta) -> list[str]:
         """Collect and register reusable variants from every configured search client."""
